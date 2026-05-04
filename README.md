@@ -15,7 +15,7 @@ Pi extension that adds a `tmux_run` tool and a live tmux widget inside Pi.
 ## Install
 
 ```sh
-ln -sf "$(pwd)/pi-live-terminal.ts" ~/.pi/agent/extensions/pi-live-terminal.ts
+pi install npm:pi-live-terminal
 ```
 
 Restart Pi after installing or updating the extension.

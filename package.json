@@ -1,0 +1,34 @@
+{
+  "name": "pi-live-terminal",
+  "version": "0.1.0",
+  "description": "Pi extension that runs commands in tmux and displays a live terminal widget.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tanishqkancharla/pi-live-terminal.git"
+  },
+  "homepage": "https://github.com/tanishqkancharla/pi-live-terminal#readme",
+  "bugs": {
+    "url": "https://github.com/tanishqkancharla/pi-live-terminal/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "tmux",
+    "terminal"
+  ],
+  "license": "MIT",
+  "files": [
+    "README.md",
+    "pi-live-terminal.ts"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./pi-live-terminal.ts"
+    ]
+  }
+}
