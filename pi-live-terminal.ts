@@ -478,10 +478,61 @@ sleep 300`)}`;
     );
   }
 
+  async function killAttachmentSession(attachment: LiveTerminalAttachment) {
+    if (!attachment.sessionName) {
+      await tmux(["kill-pane", "-t", attachment.target]);
+      return;
+    }
+
+    try {
+      await tmux(["kill-session", "-t", attachment.sessionName]);
+    } catch {
+      await tmux(["kill-pane", "-t", attachment.target]);
+    }
+  }
+
+  async function closeLiveTerminal(ctx: any, kill: boolean) {
+    const attachment = currentAttachment;
+    ctx.ui?.setWidget?.(WIDGET_ID, undefined);
+    currentAttachment = undefined;
+
+    if (!attachment) {
+      const message = "No live terminal is attached.";
+      ctx.ui?.notify?.(message, "info");
+      return { message, killed: false };
+    }
+
+    pi.appendEntry(ENTRY_TYPE, {
+      action: kill ? "kill" : "detach",
+      target: attachment.target,
+      sessionName: attachment.sessionName,
+      at: Date.now(),
+    });
+
+    if (kill) {
+      try {
+        await killAttachmentSession(attachment);
+        const message = `Closed live terminal and killed session ${attachmentName(attachment)}`;
+        ctx.ui?.notify?.(message, "info");
+        return { message, killed: true, sessionName: attachment.sessionName, target: attachment.target };
+      } catch (error) {
+        const message = `Closed live terminal widget, but failed to kill session ${attachmentName(attachment)}: ${error instanceof Error ? error.message : String(error)}`;
+        ctx.ui?.notify?.(message, "warning");
+        return { message, killed: false, sessionName: attachment.sessionName, target: attachment.target };
+      }
+    }
+
+    const message = attachment.state === "completed"
+      ? `Closed live terminal widget for completed session ${attachmentName(attachment)}`
+      : `Detached live terminal widget from session ${attachmentName(attachment)}`;
+    ctx.ui?.notify?.(message, "info");
+    return { message, killed: false, sessionName: attachment.sessionName, target: attachment.target };
+  }
+
   async function openFocusModal(ctx: any) {
     const attachment = currentAttachment;
     if (!attachment) {
-      ctx.ui.notify("No Tmux widget is attached. Start one with run_live_terminal or /live-terminal:attach first.", "warning");
+      ctx.ui.notify("No Tmux widget is attached. Start one with live_terminal_run or /live-terminal:attach first.", "warning");
       return;
     }
     if (focusModalOpen) return;
@@ -514,30 +565,7 @@ sleep 300`)}`;
   }
 
   async function detachWidget(ctx: { ui: { setWidget: Function; notify: Function } }, kill = false) {
-    const attachment = currentAttachment;
-    ctx.ui.setWidget(WIDGET_ID, undefined);
-    currentAttachment = undefined;
-    pi.appendEntry(ENTRY_TYPE, { action: kill ? "kill" : "detach", target: attachment?.target, at: Date.now() });
-    if (kill && attachment?.target) {
-      try {
-        await tmux(["kill-pane", "-t", attachment.target]);
-        ctx.ui.notify(`Detached Tmux widget and killed session ${attachmentName(attachment)}`, "info");
-      } catch (error) {
-        ctx.ui.notify(
-          `Detached Tmux widget, but failed to kill session ${attachmentName(attachment)}: ${error instanceof Error ? error.message : String(error)}`,
-          "warning",
-        );
-      }
-      return;
-    }
-    ctx.ui.notify(
-      attachment
-        ? attachment.state === "completed"
-          ? `Closed live terminal widget for completed session ${attachmentName(attachment)}`
-          : `Detached Tmux widget from session ${attachmentName(attachment)}`
-        : "Detached Tmux widget.",
-      "info",
-    );
+    await closeLiveTerminal(ctx, kill);
   }
 
   pi.registerShortcut(Key.ctrlShift("x"), {
@@ -635,31 +663,7 @@ sleep 300`)}`;
     description: "Detach the live terminal widget and optionally kill its tmux session",
     handler: async (args, ctx) => {
       const shouldKill = args.trim() === "--kill" || args.trim() === "kill";
-      const attachment = currentAttachment;
-      ctx.ui.setWidget(WIDGET_ID, undefined);
-      currentAttachment = undefined;
-      pi.appendEntry(ENTRY_TYPE, { action: shouldKill ? "kill" : "detach", target: attachment?.target, at: Date.now() });
-
-      if (shouldKill && attachment?.target) {
-        try {
-          await tmux(["kill-pane", "-t", attachment.target]);
-          ctx.ui.notify(`Detached live terminal and killed session ${attachmentName(attachment)}`, "info");
-        } catch (error) {
-          ctx.ui.notify(
-            `Closed live terminal widget, but failed to kill session ${attachmentName(attachment)}: ${error instanceof Error ? error.message : String(error)}`,
-            "warning",
-          );
-        }
-      } else {
-        ctx.ui.notify(
-          attachment
-            ? attachment.state === "completed"
-              ? `Closed live terminal widget for completed session ${attachmentName(attachment)}`
-              : `Detached live terminal widget from session ${attachmentName(attachment)}`
-            : "Detached live terminal widget.",
-          "info",
-        );
-      }
+      await closeLiveTerminal(ctx, shouldKill);
     },
   });
 
@@ -686,14 +690,15 @@ sleep 300`)}`;
   });
 
   pi.registerTool({
-    name: "run_live_terminal",
+    name: "live_terminal_run",
     label: "Run Live Terminal",
     description:
       "Start a command in a detached tmux session and show a live Tmux widget attached to it. Returns the tmux session id immediately.",
     promptSnippet:
-      "run_live_terminal: run a command in a detached tmux session with a live Tmux widget visible to the user.",
+      "live_terminal_run: run a command in a detached tmux session with a live Tmux widget visible to the user.",
     promptGuidelines: [
-      "For interactive, TTY, full-screen, watch-mode, development-server, or long-running flows, use run_live_terminal instead of bash so the user can see and interact with the running process.",
+      "For interactive, TTY, full-screen, watch-mode, development-server, or long-running flows, use live_terminal_run instead of bash so the user can see and interact with the running process.",
+      "When the session is no longer needed, use live_terminal_close to close the widget and kill the tmux session.",
     ],
     parameters: Type.Object({
       command: Type.String({
@@ -736,7 +741,7 @@ sleep 300`)}`;
     renderCall(args, theme) {
       const toolArgs = args as { command?: unknown };
       const command = typeof toolArgs.command === "string" ? toolArgs.command : "";
-      const content = theme.fg("toolTitle", "run_live_terminal ") + theme.fg("dim", compactText(command, 160));
+      const content = theme.fg("toolTitle", "live_terminal_run ") + theme.fg("dim", compactText(command, 160));
       return new Text(content, 0, 0);
     },
     renderResult(result, _options, theme) {
@@ -747,6 +752,41 @@ sleep 300`)}`;
           ? startedVisibleMessage(details.sessionName)
           : "Started and attached to tmux session.";
       return new Text(theme.fg("success", message), 0, 0);
+    },
+  });
+
+  pi.registerTool({
+    name: "live_terminal_close",
+    label: "Close Live Terminal",
+    description:
+      "Close the attached live terminal widget and kill its tmux session.",
+    promptSnippet:
+      "live_terminal_close: close the attached live terminal widget and kill its tmux session.",
+    promptGuidelines: [
+      "Use live_terminal_close when a live terminal session started with live_terminal_run is no longer needed.",
+      "This closes the live pane and kills the attached tmux session; it does not merely detach the widget.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const result = await closeLiveTerminal(ctx, true);
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.message,
+          },
+        ],
+        details: result,
+      };
+    },
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", "live_terminal_close"), 0, 0);
+    },
+    renderResult(result, _options, theme) {
+      const details = result.details as { message?: unknown; killed?: unknown } | undefined;
+      const message = typeof details?.message === "string" ? details.message : "Closed live terminal.";
+      const color = details?.killed === false ? "warning" : "success";
+      return new Text(theme.fg(color, message), 0, 0);
     },
   });
 }
