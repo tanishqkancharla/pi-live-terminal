@@ -1,5 +1,4 @@
-<img width="1536" height="768" alt="tanishqk_Overhead_aerial_view_of_New_York_City_at_golden_hour_930c0139-1e36-41a0-843f-aec63532c8f2_3" src="https://github.com/user-attachments/assets/97aede62-43ec-42b6-9056-93e20be7dd7f" />
-
+<img width="1680" height="720" alt="tanishqk_Overhead_aerial_view_of_New_York_City_at_golden_hour_650bc1e7-22f5-4e28-9576-ceaa73ed132c_0" src="https://github.com/user-attachments/assets/219e4167-d04f-4c8a-9373-bdf3a6e96856" />
 
 # pi-live-terminal
 
