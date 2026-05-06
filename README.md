@@ -2,6 +2,8 @@
 
 Pi extension that adds a `run_live_terminal` tool and a live tmux widget inside Pi.
 
+https://github.com/user-attachments/assets/b4ec6d34-fd8a-4254-bf74-e216779649f6
+
 ## What it does
 
 - Starts long-running or interactive commands in detached tmux sessions.
