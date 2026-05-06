@@ -9,6 +9,7 @@ const CAPTURE_LINES = 200;
 const VISIBLE_LINES = 16;
 const POLL_MS = 500;
 const CONTENT_PADDING = 1;
+const WHEEL_SCROLL_LINES = 3;
 const WIDGET_ID = "pi-live-terminal";
 const ENTRY_TYPE = "pi-live-terminal";
 const DEFAULT_TITLE = "tmux";
@@ -27,6 +28,7 @@ type LiveTerminalAttachment = {
 let currentAttachment: LiveTerminalAttachment | undefined;
 let focusModalOpen = false;
 const reportedExitTargets = new Set<string>();
+let mouseReportingRefCount = 0;
 
 function safeSessionName(input?: string): string {
   const base = (input || `pi-live-${randomBytes(4).toString("hex")}`)
@@ -59,6 +61,49 @@ function attachmentName(attachment: LiveTerminalAttachment): string {
 function statusGlyph(state: "running" | "completed" | "unknown", status?: string): string {
   if (state === "completed") return status === "0" ? "🟢" : "🔴";
   return SPINNER_FRAMES[Math.floor(Date.now() / POLL_MS) % SPINNER_FRAMES.length];
+}
+
+function enableMouseReporting(): void {
+  if (!process.stdout.isTTY) return;
+  if (mouseReportingRefCount++ === 0) {
+    process.stdout.write("\x1b[?1000h\x1b[?1006h");
+  }
+}
+
+function disableMouseReporting(): void {
+  if (!process.stdout.isTTY || mouseReportingRefCount === 0) return;
+  mouseReportingRefCount--;
+  if (mouseReportingRefCount === 0) {
+    process.stdout.write("\x1b[?1006l\x1b[?1000l");
+  }
+}
+
+function parseSgrMouse(data: string): { button: number; x: number; y: number } | undefined {
+  const match = data.match(/^\x1b\[<(\d+);(\d+);(\d+)[Mm]$/);
+  if (!match) return undefined;
+  return {
+    button: Number(match[1]),
+    x: Number(match[2]),
+    y: Number(match[3]),
+  };
+}
+
+function wheelScrollDelta(data: string): number | undefined {
+  const mouse = parseSgrMouse(data);
+  if (!mouse || (mouse.button & 64) === 0) return undefined;
+
+  const wheelButton = mouse.button & 3;
+  if (wheelButton === 0) return -WHEEL_SCROLL_LINES;
+  if (wheelButton === 1) return WHEEL_SCROLL_LINES;
+  return undefined;
+}
+
+function maxScrollOffset(lineCount: number, visibleLines: number): number {
+  return Math.max(0, lineCount - visibleLines);
+}
+
+function clampScrollOffset(offset: number, lineCount: number, visibleLines: number): number {
+  return Math.min(Math.max(0, offset), maxScrollOffset(lineCount, visibleLines));
 }
 
 function tmux(args: string[]): Promise<string> {
@@ -181,15 +226,30 @@ class LiveTerminalWidget implements Component {
       ]).catch(() => "");
       const exitStatus = status.trim();
       const wasCompleted = this.state === "completed";
+      const wasAtBottom = this.scrollOffset >= maxScrollOffset(this.lines.length, VISIBLE_LINES);
       this.lines = output.replace(/\s+$/g, "").split("\n");
       this.error = undefined;
       this.exitStatus = exitStatus || undefined;
       this.state = exitStatus ? "completed" : "running";
       if (exitStatus && !wasCompleted) this.onExit?.(exitStatus);
-      this.scrollOffset = Math.max(0, this.lines.length - VISIBLE_LINES);
+      this.scrollOffset = wasAtBottom
+        ? maxScrollOffset(this.lines.length, VISIBLE_LINES)
+        : clampScrollOffset(this.scrollOffset, this.lines.length, VISIBLE_LINES);
     } catch (error) {
       this.error = error instanceof Error ? error.message : String(error);
     }
+    this.tui.requestRender();
+  }
+
+  handleInput(data: string): void {
+    const delta = wheelScrollDelta(data);
+    if (delta === undefined) return;
+
+    this.scrollOffset = clampScrollOffset(
+      this.scrollOffset + delta,
+      this.lines.length,
+      VISIBLE_LINES,
+    );
     this.tui.requestRender();
   }
 
@@ -283,6 +343,7 @@ class TmuxFocusModal implements Component {
     private done: () => void,
     private onExit?: (status: string) => void,
   ) {
+    enableMouseReporting();
     this.timer = setInterval(() => void this.refresh(), POLL_MS);
     void this.refresh();
   }
@@ -293,6 +354,7 @@ class TmuxFocusModal implements Component {
 
   private async refresh(): Promise<void> {
     try {
+      const visibleLines = this.visibleLines();
       const output = await tmux([
         "capture-pane",
         "-p",
@@ -313,12 +375,15 @@ class TmuxFocusModal implements Component {
       ]).catch(() => "");
       const exitStatus = status.trim();
       const wasCompleted = this.state === "completed";
+      const wasAtBottom = this.scrollOffset >= maxScrollOffset(this.lines.length, visibleLines);
       this.lines = output.replace(/\s+$/g, "").split("\n");
       this.error = undefined;
       this.exitStatus = exitStatus || undefined;
       this.state = exitStatus ? "completed" : "running";
       if (exitStatus && !wasCompleted) this.onExit?.(exitStatus);
-      this.scrollOffset = Math.max(0, this.lines.length - this.visibleLines());
+      this.scrollOffset = wasAtBottom
+        ? maxScrollOffset(this.lines.length, visibleLines)
+        : clampScrollOffset(this.scrollOffset, this.lines.length, visibleLines);
     } catch (error) {
       this.error = error instanceof Error ? error.message : String(error);
     }
@@ -326,6 +391,19 @@ class TmuxFocusModal implements Component {
   }
 
   handleInput(data: string): void {
+    const delta = wheelScrollDelta(data);
+    if (delta !== undefined) {
+      this.scrollOffset = clampScrollOffset(
+        this.scrollOffset + delta,
+        this.lines.length,
+        this.visibleLines(),
+      );
+      this.tui.requestRender();
+      return;
+    }
+
+    if (parseSgrMouse(data)) return;
+
     if (matchesKey(data, Key.ctrlShift("f"))) {
       this.done();
       return;
@@ -391,6 +469,7 @@ class TmuxFocusModal implements Component {
 
     const hints = [
       shortcut(" ctrl+shift+f ") + dim("close focus"),
+      dim("scroll wheel scrolls output"),
       dim("input is sent to tmux"),
     ].join(border(" · "));
     const hintsWidth = visibleWidth(hints);
@@ -402,6 +481,7 @@ class TmuxFocusModal implements Component {
   invalidate(): void {}
 
   dispose(): void {
+    disableMouseReporting();
     clearInterval(this.timer);
   }
 }
@@ -560,6 +640,7 @@ sleep 300`)}`;
         },
       );
     } finally {
+      disableMouseReporting();
       focusModalOpen = false;
     }
   }
