@@ -1,16 +1,19 @@
 # pi-live-terminal
 
-Pi extension that adds a `tmux_run` tool and a live tmux widget inside Pi.
+Pi extension that adds a `run_live_terminal` tool and a live tmux widget inside Pi.
 
 ## What it does
 
 - Starts long-running or interactive commands in detached tmux sessions.
 - Shows live terminal output in a Pi widget above the editor.
-- Reattaches the widget when a Pi session restarts and the tmux pane still exists.
-- Adds `/tmux-attach` and `/live-terminal-close` commands.
+- Reports completed processes to the human and agent with the exit status code.
+- Reattaches the widget when a Pi session restarts and the tmux session still exists.
+- Adds `/live-terminal:run`, `/live-terminal:attach`, `/live-terminal:focus`, and `/live-terminal:close` commands.
 - Adds shortcuts:
-  - `ctrl+shift+x` — unattach and kill the tmux pane
-  - `ctrl+shift+v` — unattach without killing the tmux pane
+  - `ctrl+shift+f` — focus the tmux session in a full-screen interactive modal; press it again to close the modal
+  - `esc` — close the focused modal
+  - `ctrl+shift+x` — detach and kill the tmux session
+  - `ctrl+shift+v` — detach without killing the tmux session; after completion, close the widget
 
 ## Install
 

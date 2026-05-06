@@ -1,6 +1,6 @@
 import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import type { Component, TUI } from "@mariozechner/pi-tui";
-import { Key, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Key, Text, decodeKittyPrintable, matchesKey, parseKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { execFile, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -8,11 +8,25 @@ import { randomBytes } from "node:crypto";
 const CAPTURE_LINES = 200;
 const VISIBLE_LINES = 16;
 const POLL_MS = 500;
+const CONTENT_PADDING = 1;
 const WIDGET_ID = "pi-live-terminal";
 const ENTRY_TYPE = "pi-live-terminal";
 const DEFAULT_TITLE = "tmux";
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-let currentAttachment: { target: string; title: string } | undefined;
+type LiveTerminalAttachment = {
+  target: string;
+  title: string;
+  sessionName?: string;
+  command?: string;
+  cwd?: string;
+  state?: "running" | "completed";
+  status?: string;
+};
+
+let currentAttachment: LiveTerminalAttachment | undefined;
+let focusModalOpen = false;
+const reportedExitTargets = new Set<string>();
 
 function safeSessionName(input?: string): string {
   const base = (input || `pi-live-${randomBytes(4).toString("hex")}`)
@@ -23,6 +37,28 @@ function safeSessionName(input?: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function compactText(value: string, maxLength: number): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length > maxLength ? `${compact.slice(0, Math.max(0, maxLength - 1))}…` : compact;
+}
+
+function startedMessage(sessionName: string): string {
+  return `Started and attached to tmux session ${sessionName}.`;
+}
+
+function startedVisibleMessage(sessionName: string): string {
+  return startedMessage(sessionName);
+}
+
+function attachmentName(attachment: LiveTerminalAttachment): string {
+  return attachment.sessionName || attachment.title || attachment.target;
+}
+
+function statusGlyph(state: "running" | "completed" | "unknown", status?: string): string {
+  if (state === "completed") return status === "0" ? "🟢" : "🔴";
+  return SPINNER_FRAMES[Math.floor(Date.now() / POLL_MS) % SPINNER_FRAMES.length];
 }
 
 function tmux(args: string[]): Promise<string> {
@@ -37,10 +73,77 @@ function tmux(args: string[]): Promise<string> {
   });
 }
 
+function sendTmuxInput(target: string, data: string): Promise<string> {
+  const printable = decodeKittyPrintable(data) ?? (isPrintableText(data) ? data : undefined);
+  if (printable !== undefined) {
+    return tmux(["send-keys", "-t", target, "-l", printable]);
+  }
+
+  const key = parseKey(data);
+  const tmuxKey = key ? toTmuxKey(key) : undefined;
+  if (tmuxKey) {
+    return tmux(["send-keys", "-t", target, tmuxKey]);
+  }
+
+  return tmux(["send-keys", "-t", target, "-l", data]);
+}
+
+function isPrintableText(data: string): boolean {
+  return data.length > 0 && !data.startsWith("\x1b") && Array.from(data).every((char) => {
+    const code = char.codePointAt(0) ?? 0;
+    return code >= 32 && code !== 127;
+  });
+}
+
+function toTmuxKey(key: string): string | undefined {
+  const special: Record<string, string> = {
+    escape: "Escape",
+    esc: "Escape",
+    enter: "Enter",
+    return: "Enter",
+    tab: "Tab",
+    backspace: "BSpace",
+    delete: "DC",
+    insert: "IC",
+    home: "Home",
+    end: "End",
+    pageUp: "PPage",
+    pageDown: "NPage",
+    up: "Up",
+    down: "Down",
+    left: "Left",
+    right: "Right",
+    f1: "F1",
+    f2: "F2",
+    f3: "F3",
+    f4: "F4",
+    f5: "F5",
+    f6: "F6",
+    f7: "F7",
+    f8: "F8",
+    f9: "F9",
+    f10: "F10",
+    f11: "F11",
+    f12: "F12",
+  };
+  if (special[key]) return special[key];
+
+  const parts = key.split("+");
+  const base = parts.pop();
+  if (!base) return undefined;
+  const tmuxBase = special[base] || base;
+  const modifiers = parts
+    .map((part) => ({ ctrl: "C", shift: "S", alt: "M" })[part])
+    .filter(Boolean);
+  if (modifiers.length === 0) return undefined;
+  return `${modifiers.join("-")}-${tmuxBase}`;
+}
+
 class LiveTerminalWidget implements Component {
   private lines: string[] = [];
   private error: string | undefined;
   private state: "running" | "completed" | "unknown" = "unknown";
+  private exitStatus: string | undefined;
   private timer: NodeJS.Timeout;
   private scrollOffset = 0;
   private lastResize = "";
@@ -50,6 +153,7 @@ class LiveTerminalWidget implements Component {
     private theme: Theme,
     private target: string,
     private title: string = DEFAULT_TITLE,
+    private onExit?: (status: string) => void,
   ) {
     this.timer = setInterval(() => void this.refresh(), POLL_MS);
     void this.refresh();
@@ -75,9 +179,13 @@ class LiveTerminalWidget implements Component {
         this.target,
         "@pi_tmux_run_status",
       ]).catch(() => "");
+      const exitStatus = status.trim();
+      const wasCompleted = this.state === "completed";
       this.lines = output.replace(/\s+$/g, "").split("\n");
       this.error = undefined;
-      this.state = status.trim() ? "completed" : "running";
+      this.exitStatus = exitStatus || undefined;
+      this.state = exitStatus ? "completed" : "running";
+      if (exitStatus && !wasCompleted) this.onExit?.(exitStatus);
       this.scrollOffset = Math.max(0, this.lines.length - VISIBLE_LINES);
     } catch (error) {
       this.error = error instanceof Error ? error.message : String(error);
@@ -88,7 +196,8 @@ class LiveTerminalWidget implements Component {
   render(width: number): string[] {
     const th = this.theme;
     const innerW = Math.max(1, width - 2);
-    const resizeKey = `${innerW}x${VISIBLE_LINES}`;
+    const tmuxW = Math.max(1, innerW - CONTENT_PADDING * 2);
+    const resizeKey = `${tmuxW}x${VISIBLE_LINES}`;
     if (resizeKey !== this.lastResize) {
       this.lastResize = resizeKey;
       void tmux([
@@ -96,7 +205,7 @@ class LiveTerminalWidget implements Component {
         "-t",
         this.target,
         "-x",
-        String(innerW),
+        String(tmuxW),
         "-y",
         String(VISIBLE_LINES),
       ]).catch(() => {});
@@ -116,12 +225,11 @@ class LiveTerminalWidget implements Component {
     const result: string[] = [];
 
     result.push("");
-    const stateLabel = this.state === "completed" ? "completed" : "running";
-    const rawTitle = ` Tmux (${this.title}) ${stateLabel} `;
-    const maxTitleWidth = Math.max(1, innerW - 2);
-    const title = rawTitle.length > maxTitleWidth ? `${rawTitle.slice(0, Math.max(0, maxTitleWidth - 1))}…` : rawTitle;
-    const rightRuleWidth = Math.max(1, innerW - 1 - title.length);
-    result.push(border(`╭─${title}${"─".repeat(rightRuleWidth)}╮`));
+    const rawTitle = ` ${statusGlyph(this.state, this.exitStatus)} Live Terminal (${this.title}) `;
+    const maxTitleWidth = Math.max(1, innerW - 1);
+    const title = truncateToWidth(rawTitle, maxTitleWidth, "…");
+    const rightRuleWidth = Math.max(0, innerW - 1 - visibleWidth(title));
+    result.push(border("╭─") + title + border(`${"─".repeat(rightRuleWidth)}╮`));
 
     const body = this.error
       ? [th.fg("error", `tmux: ${this.error}`)]
@@ -131,13 +239,160 @@ class LiveTerminalWidget implements Component {
       this.scrollOffset + VISIBLE_LINES,
     );
     for (const line of visible)
-      result.push(border("│") + pad(` ${line}`) + border("│"));
+      result.push(border("│") + pad(`${" ".repeat(CONTENT_PADDING)}${line}`) + border("│"));
     for (let i = visible.length; i < VISIBLE_LINES; i++)
       result.push(border("│") + pad("") + border("│"));
 
+    const hints = (this.state === "completed"
+      ? [
+          shortcut(" ctrl+shift+f ") + dim("focus"),
+          shortcut(" ctrl+shift+v ") + dim("close"),
+        ]
+      : [
+          shortcut(" ctrl+shift+f ") + dim("focus"),
+          shortcut(" ctrl+shift+x ") + dim("kill"),
+          shortcut(" ctrl+shift+v ") + dim("detach"),
+        ]).join(border(" · "));
+    const hintsWidth = visibleWidth(hints);
+    const leftRuleWidth = Math.max(1, innerW - hintsWidth - 1);
+    result.push(border("╰") + border("─".repeat(leftRuleWidth)) + hints + border("─╯"));
+    return result;
+  }
+
+  invalidate(): void {}
+
+  dispose(): void {
+    clearInterval(this.timer);
+  }
+}
+
+class TmuxFocusModal implements Component {
+  private lines: string[] = [];
+  private error: string | undefined;
+  private state: "running" | "completed" | "unknown" = "unknown";
+  private exitStatus: string | undefined;
+  private timer: NodeJS.Timeout;
+  private scrollOffset = 0;
+  private lastResize = "";
+
+  constructor(
+    private tui: TUI,
+    private theme: Theme,
+    private target: string,
+    private title: string,
+    private done: () => void,
+    private onExit?: (status: string) => void,
+  ) {
+    this.timer = setInterval(() => void this.refresh(), POLL_MS);
+    void this.refresh();
+  }
+
+  private visibleLines(): number {
+    return Math.max(1, this.tui.terminal.rows - 2);
+  }
+
+  private async refresh(): Promise<void> {
+    try {
+      const output = await tmux([
+        "capture-pane",
+        "-p",
+        "-e",
+        "-J",
+        "-S",
+        `-${CAPTURE_LINES}`,
+        "-t",
+        this.target,
+      ]);
+      const status = await tmux([
+        "show-option",
+        "-p",
+        "-qv",
+        "-t",
+        this.target,
+        "@pi_tmux_run_status",
+      ]).catch(() => "");
+      const exitStatus = status.trim();
+      const wasCompleted = this.state === "completed";
+      this.lines = output.replace(/\s+$/g, "").split("\n");
+      this.error = undefined;
+      this.exitStatus = exitStatus || undefined;
+      this.state = exitStatus ? "completed" : "running";
+      if (exitStatus && !wasCompleted) this.onExit?.(exitStatus);
+      this.scrollOffset = Math.max(0, this.lines.length - this.visibleLines());
+    } catch (error) {
+      this.error = error instanceof Error ? error.message : String(error);
+    }
+    this.tui.requestRender();
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.ctrlShift("f")) || matchesKey(data, Key.escape)) {
+      this.done();
+      return;
+    }
+
+    void sendTmuxInput(this.target, data)
+      .then(() => this.refresh())
+      .catch((error) => {
+        this.error = error instanceof Error ? error.message : String(error);
+        this.tui.requestRender();
+      });
+  }
+
+  render(width: number): string[] {
+    const th = this.theme;
+    const innerW = Math.max(1, width - 2);
+    const visibleLines = this.visibleLines();
+    const tmuxW = Math.max(1, innerW - CONTENT_PADDING * 2);
+    const resizeKey = `${tmuxW}x${visibleLines}`;
+    if (resizeKey !== this.lastResize) {
+      this.lastResize = resizeKey;
+      void tmux([
+        "resize-window",
+        "-t",
+        this.target,
+        "-x",
+        String(tmuxW),
+        "-y",
+        String(visibleLines),
+      ]).catch(() => {});
+    }
+
+    const border = (s: string) => th.fg("borderAccent", s);
+    const shortcut = (s: string) => th.fg("accent", s);
+    const dim = (s: string) => th.fg("dim", s);
+    const pad = (s: string) =>
+      truncateToWidth(s, innerW, "…", true).padEnd(
+        Math.max(
+          0,
+          innerW -
+            Math.max(0, visibleWidth(truncateToWidth(s, innerW, "…", true))),
+        ),
+      );
+    const result: string[] = [];
+
+    const rawTitle = ` ${statusGlyph(this.state, this.exitStatus)} Live Terminal (${this.title}) `;
+    const maxTitleWidth = Math.max(1, innerW - 1);
+    const title = truncateToWidth(rawTitle, maxTitleWidth, "…");
+    const rightRuleWidth = Math.max(0, innerW - 1 - visibleWidth(title));
+    result.push(border("╭─") + title + border(`${"─".repeat(rightRuleWidth)}╮`));
+
+    const body = this.error
+      ? [th.fg("error", `tmux: ${this.error}`)]
+      : this.lines;
+    const visible = body.slice(
+      this.scrollOffset,
+      this.scrollOffset + visibleLines,
+    );
+    for (const line of visible)
+      result.push(border("│") + pad(`${" ".repeat(CONTENT_PADDING)}${line}`) + border("│"));
+    for (let i = visible.length; i < visibleLines; i++)
+      result.push(border("│") + pad("") + border("│"));
+
     const hints = [
-      shortcut(" ctrl+shift+x ") + dim("kill"),
-      shortcut(" ctrl+shift+v ") + dim("unattach"),
+      shortcut(" esc ") + dim("close"),
+      shortcut(" ctrl+shift+f ") + dim("close focus"),
+      dim("input is sent to tmux"),
     ].join(border(" · "));
     const hintsWidth = visibleWidth(hints);
     const leftRuleWidth = Math.max(1, innerW - hintsWidth - 1);
@@ -153,14 +408,110 @@ class LiveTerminalWidget implements Component {
 }
 
 export default function (pi: ExtensionAPI) {
-  function showWidget(ctx: any, target: string, title: string = DEFAULT_TITLE) {
+  async function startLiveTerminal(
+    ctx: { cwd?: string; hasUI?: boolean },
+    command: string,
+    options: { sessionName?: string; title?: string } = {},
+  ) {
+    const sessionName = safeSessionName(options.sessionName);
+    const title = options.title || options.sessionName || compactText(command, 48) || DEFAULT_TITLE;
+    const cwd = ctx.cwd || process.cwd();
+    const wrappedCommand = `bash -lc ${shellQuote(`${command}
+status=$?
+printf '\n[Session exited with status %s]\n' "$status"
+tmux set-option -p -t "$TMUX_PANE" @pi_tmux_run_status "$status" 2>/dev/null || true
+sleep 300`)}`;
+
+    execFileSync(
+      "tmux",
+      ["new-session", "-d", "-s", sessionName, "-c", cwd, wrappedCommand],
+      {
+        encoding: "utf8",
+      },
+    );
+
+    const paneId = await tmux(["display-message", "-p", "-t", sessionName, "#{pane_id}"]);
+    const target = paneId.trim() || sessionName;
+
+    if (ctx.hasUI) {
+      showWidget(ctx, { target, sessionName, title, command, cwd, state: "running" });
+    }
+
+    pi.appendEntry(ENTRY_TYPE, { action: "open", target, sessionName, title, command, cwd, state: "running", at: Date.now() });
+
+    return { sessionName, target, title, command, cwd };
+  }
+
+  function reportProcessExit(ctx: any, attachment: LiveTerminalAttachment, status: string) {
+    if (reportedExitTargets.has(attachment.target)) return;
+    reportedExitTargets.add(attachment.target);
+
+    const nextAttachment = currentAttachment?.target === attachment.target ? currentAttachment : attachment;
+    nextAttachment.state = "completed";
+    nextAttachment.status = status;
+
+    pi.appendEntry(ENTRY_TYPE, {
+      action: "exit",
+      target: attachment.target,
+      sessionName: attachment.sessionName,
+      title: attachment.title,
+      command: attachment.command,
+      cwd: attachment.cwd,
+      status,
+      at: Date.now(),
+    });
+    ctx.ui.notify(`Session exited with status code ${status}: ${attachmentName(attachment)}`, "info");
+  }
+
+  function showWidget(ctx: any, attachment: LiveTerminalAttachment) {
     if (!ctx.hasUI) return;
-    currentAttachment = { target, title };
+    currentAttachment = attachment;
     ctx.ui.setWidget(
       WIDGET_ID,
-      (tui: TUI, theme: Theme) => new LiveTerminalWidget(tui, theme, target, title),
+      (tui: TUI, theme: Theme) => new LiveTerminalWidget(
+        tui,
+        theme,
+        attachment.target,
+        attachment.title,
+        (status) => reportProcessExit(ctx, attachment, status),
+      ),
       { placement: "aboveEditor" },
     );
+  }
+
+  async function openFocusModal(ctx: any) {
+    const attachment = currentAttachment;
+    if (!attachment) {
+      ctx.ui.notify("No Tmux widget is attached. Start one with run_live_terminal or /live-terminal:attach first.", "warning");
+      return;
+    }
+    if (focusModalOpen) return;
+
+    focusModalOpen = true;
+    try {
+      await ctx.ui.custom(
+        (tui: TUI, theme: Theme, _keybindings: unknown, done: () => void) =>
+          new TmuxFocusModal(
+            tui,
+            theme,
+            attachment.target,
+            attachment.title,
+            done,
+            (status) => reportProcessExit(ctx, attachment, status),
+          ),
+        {
+          overlay: true,
+          overlayOptions: {
+            anchor: "center",
+            width: "100%",
+            maxHeight: "100%",
+            margin: 0,
+          },
+        },
+      );
+    } finally {
+      focusModalOpen = false;
+    }
   }
 
   async function detachWidget(ctx: { ui: { setWidget: Function; notify: Function } }, kill = false) {
@@ -171,31 +522,42 @@ export default function (pi: ExtensionAPI) {
     if (kill && attachment?.target) {
       try {
         await tmux(["kill-pane", "-t", attachment.target]);
-        ctx.ui.notify(`Unattached Tmux widget and killed pane ${attachment.target}`, "info");
+        ctx.ui.notify(`Detached Tmux widget and killed session ${attachmentName(attachment)}`, "info");
       } catch (error) {
         ctx.ui.notify(
-          `Unattached Tmux widget, but failed to kill pane ${attachment.target}: ${error instanceof Error ? error.message : String(error)}`,
+          `Detached Tmux widget, but failed to kill session ${attachmentName(attachment)}: ${error instanceof Error ? error.message : String(error)}`,
           "warning",
         );
       }
       return;
     }
-    ctx.ui.notify(attachment ? `Unattached Tmux widget from pane ${attachment.target}` : "Unattached Tmux widget.", "info");
+    ctx.ui.notify(
+      attachment
+        ? attachment.state === "completed"
+          ? `Closed live terminal widget for completed session ${attachmentName(attachment)}`
+          : `Detached Tmux widget from session ${attachmentName(attachment)}`
+        : "Detached Tmux widget.",
+      "info",
+    );
   }
 
   pi.registerShortcut(Key.ctrlShift("x"), {
-    description: "Unattach the Tmux widget and kill its pane",
+    description: "Detach the Tmux widget and kill its session",
     handler: (ctx) => detachWidget(ctx, true),
   });
 
   pi.registerShortcut(Key.ctrlShift("v"), {
-    description: "Unattach the Tmux widget without killing its pane",
+    description: "Detach the Tmux widget without killing its session, or close it after completion",
     handler: (ctx) => detachWidget(ctx, false),
   });
 
+  pi.registerShortcut(Key.ctrlShift("f"), {
+    description: "Focus the Tmux session in a large interactive modal",
+    handler: (ctx) => openFocusModal(ctx),
+  });
+
   pi.on("session_start", async (_event, ctx) => {
-    let target: string | undefined;
-    let title = DEFAULT_TITLE;
+    let attachment: LiveTerminalAttachment | undefined;
     for (const entry of ctx.sessionManager.getEntries()) {
       if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
       const data = entry.data as any;
@@ -203,26 +565,75 @@ export default function (pi: ExtensionAPI) {
         data?.action === "open" &&
         (typeof data.target === "string" || typeof data.sessionName === "string")
       ) {
-        target = data.target || data.paneId || data.sessionName;
-        title = typeof data.title === "string" ? data.title : DEFAULT_TITLE;
+        attachment = {
+          target: data.target || data.paneId || data.sessionName,
+          sessionName: typeof data.sessionName === "string" ? data.sessionName : undefined,
+          title: typeof data.title === "string" ? data.title : DEFAULT_TITLE,
+          command: typeof data.command === "string" ? data.command : undefined,
+          cwd: typeof data.cwd === "string" ? data.cwd : undefined,
+          state: data.state === "completed" ? "completed" : "running",
+        };
+      } else if (data?.action === "exit" && typeof data.target === "string") {
+        reportedExitTargets.add(data.target);
+        if (attachment?.target === data.target) {
+          attachment.state = "completed";
+          attachment.status = typeof data.status === "string" ? data.status : undefined;
+        }
       } else if (data?.action === "detach" || data?.action === "kill" || data?.action === "close") {
-        target = undefined;
-        title = DEFAULT_TITLE;
+        attachment = undefined;
       }
     }
 
-    if (!target) return;
+    if (!attachment) return;
     try {
-      await tmux(["display-message", "-p", "-t", target, "#{pane_id}"]);
-      showWidget(ctx, target, title);
-      ctx.ui.notify(`Reattached Tmux widget to pane ${target}`, "info");
+      await tmux(["display-message", "-p", "-t", attachment.target, "#{pane_id}"]);
+      attachment.sessionName ||= (await tmux(["display-message", "-p", "-t", attachment.target, "#{session_name}"])).trim() || undefined;
+      showWidget(ctx, attachment);
+      ctx.ui.notify(`Reattached Tmux widget to session ${attachmentName(attachment)}`, "info");
     } catch {
-      pi.appendEntry(ENTRY_TYPE, { action: "detach", target, reason: "tmux pane missing", at: Date.now() });
+      pi.appendEntry(ENTRY_TYPE, { action: "detach", target: attachment.target, reason: "tmux target missing", at: Date.now() });
     }
   });
 
-  pi.registerCommand("live-terminal-close", {
-    description: "Unattach the live terminal widget and optionally kill its tmux pane",
+  pi.registerCommand("live-terminal:focus", {
+    description: "Focus the attached Tmux session in a large interactive modal",
+    handler: async (_args, ctx) => {
+      await openFocusModal(ctx);
+    },
+  });
+
+  pi.registerCommand("live-terminal:run", {
+    description: "Start a command in a live terminal and attach the widget",
+    handler: async (args, ctx) => {
+      const command = args.trim();
+      if (!command) {
+        ctx.ui.notify("Usage: /live-terminal:run <shell-command>", "warning");
+        return;
+      }
+
+      try {
+        const result = await startLiveTerminal(ctx, command);
+        pi.sendMessage({
+          customType: "live-terminal-status",
+          content: `User started live terminal: session=${result.sessionName} command=${JSON.stringify(compactText(command, 300))}`,
+          display: false,
+          details: {
+            startedBy: "user",
+            sessionName: result.sessionName,
+            title: result.title,
+            cwd: result.cwd,
+            command: compactText(command, 300),
+          },
+        }, { deliverAs: "nextTurn" });
+        ctx.ui.notify(startedMessage(result.sessionName), "info");
+      } catch (error) {
+        ctx.ui.notify(`Could not start live terminal: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+    },
+  });
+
+  pi.registerCommand("live-terminal:close", {
+    description: "Detach the live terminal widget and optionally kill its tmux session",
     handler: async (args, ctx) => {
       const shouldKill = args.trim() === "--kill" || args.trim() === "kill";
       const attachment = currentAttachment;
@@ -233,53 +644,57 @@ export default function (pi: ExtensionAPI) {
       if (shouldKill && attachment?.target) {
         try {
           await tmux(["kill-pane", "-t", attachment.target]);
-          ctx.ui.notify(`Unattached live terminal and killed pane ${attachment.target}`, "info");
+          ctx.ui.notify(`Detached live terminal and killed session ${attachmentName(attachment)}`, "info");
         } catch (error) {
           ctx.ui.notify(
-            `Closed live terminal widget, but failed to kill ${attachment.target}: ${error instanceof Error ? error.message : String(error)}`,
+            `Closed live terminal widget, but failed to kill session ${attachmentName(attachment)}: ${error instanceof Error ? error.message : String(error)}`,
             "warning",
           );
         }
       } else {
         ctx.ui.notify(
           attachment
-            ? `Unattached live terminal widget from pane ${attachment.target}`
-            : "Unattached live terminal widget.",
+            ? attachment.state === "completed"
+              ? `Closed live terminal widget for completed session ${attachmentName(attachment)}`
+              : `Detached live terminal widget from session ${attachmentName(attachment)}`
+            : "Detached live terminal widget.",
           "info",
         );
       }
     },
   });
 
-  pi.registerCommand("tmux-attach", {
-    description: "Attach the Pi Tmux widget to an existing tmux pane target, e.g. %1 or session:window.pane",
+  pi.registerCommand("live-terminal:attach", {
+    description: "Attach the Pi Tmux widget to an existing tmux session target, e.g. my-session or my-session:0.0",
     handler: async (args, ctx) => {
       const [target, ...titleParts] = args.trim().split(/\s+/).filter(Boolean);
       if (!target) {
-        ctx.ui.notify("Usage: /tmux-attach <pane-target> [title]", "warning");
+        ctx.ui.notify("Usage: /live-terminal:attach <session-target> [title]", "warning");
         return;
       }
       try {
         const paneId = (await tmux(["display-message", "-p", "-t", target, "#{pane_id}"])).trim();
+        const sessionName = (await tmux(["display-message", "-p", "-t", target, "#{session_name}"])).trim() || undefined;
         const title = titleParts.join(" ") || target;
-        showWidget(ctx, paneId || target, title);
-        pi.appendEntry(ENTRY_TYPE, { action: "open", target: paneId || target, title, attachedExisting: true, at: Date.now() });
-        ctx.ui.notify(`Attached Tmux widget to pane ${paneId || target}`, "info");
+        const attachment = { target: paneId || target, sessionName, title, state: "running" as const };
+        showWidget(ctx, attachment);
+        pi.appendEntry(ENTRY_TYPE, { action: "open", target: paneId || target, sessionName, title, attachedExisting: true, at: Date.now() });
+        ctx.ui.notify(`Attached Tmux widget to session ${attachmentName(attachment)}`, "info");
       } catch (error) {
-        ctx.ui.notify(`Could not attach to tmux pane ${target}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+        ctx.ui.notify(`Could not attach to tmux session ${target}: ${error instanceof Error ? error.message : String(error)}`, "warning");
       }
     },
   });
 
   pi.registerTool({
-    name: "tmux_run",
-    label: "Tmux Run",
+    name: "run_live_terminal",
+    label: "Run Live Terminal",
     description:
       "Start a command in a detached tmux session and show a live Tmux widget attached to it. Returns the tmux session id immediately.",
     promptSnippet:
-      "tmux_run: run a command in a detached tmux session with a live Tmux widget visible to the user.",
+      "run_live_terminal: run a command in a detached tmux session with a live Tmux widget visible to the user.",
     promptGuidelines: [
-      "For interactive, TTY, full-screen, watch-mode, development-server, or long-running flows, use tmux_run instead of bash so the user can see and interact with the running process.",
+      "For interactive, TTY, full-screen, watch-mode, development-server, or long-running flows, use run_live_terminal instead of bash so the user can see and interact with the running process.",
     ],
     parameters: Type.Object({
       command: Type.String({
@@ -303,41 +718,36 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const sessionName = safeSessionName(params.session_name);
-      const title = params.title || params.session_name || DEFAULT_TITLE;
-      const cwd = params.cwd || ctx.cwd || process.cwd();
-      const wrappedCommand = `bash -lc ${shellQuote(`${params.command}
-status=$?
-printf '\n[tmux_run exited with status %s]\n' "$status"
-tmux set-option -p -t "$TMUX_PANE" @pi_tmux_run_status "$status" 2>/dev/null || true
-sleep 300`)}`;
-
-      execFileSync(
-        "tmux",
-        ["new-session", "-d", "-s", sessionName, "-c", cwd, wrappedCommand],
-        {
-          encoding: "utf8",
-        },
+      const result = await startLiveTerminal(
+        { ...ctx, cwd: params.cwd || ctx.cwd },
+        params.command,
+        { sessionName: params.session_name, title: params.title || params.session_name || DEFAULT_TITLE },
       );
-
-      const paneId = await tmux(["display-message", "-p", "-t", sessionName, "#{pane_id}"]);
-      const target = paneId.trim() || sessionName;
-
-      if (ctx.hasUI) {
-        showWidget(ctx, target, title);
-      }
-
-      pi.appendEntry(ENTRY_TYPE, { action: "open", target, sessionName, title, command: params.command, cwd, state: "running", at: Date.now() });
 
       return {
         content: [
           {
             type: "text",
-            text: `Started tmux pane ${target} in session ${sessionName}\nAttach manually with: tmux attach -t ${sessionName}\nCommand: ${params.command}`,
+            text: startedMessage(result.sessionName),
           },
         ],
-        details: { sessionName, pane: target, command: params.command, cwd },
+        details: { sessionName: result.sessionName, command: params.command, cwd: result.cwd, visibleMessage: startedVisibleMessage(result.sessionName) },
       };
+    },
+    renderCall(args, theme) {
+      const toolArgs = args as { command?: unknown };
+      const command = typeof toolArgs.command === "string" ? toolArgs.command : "";
+      const content = theme.fg("toolTitle", "run_live_terminal ") + theme.fg("dim", compactText(command, 160));
+      return new Text(content, 0, 0);
+    },
+    renderResult(result, _options, theme) {
+      const details = result.details as { visibleMessage?: unknown; sessionName?: unknown } | undefined;
+      const message = typeof details?.visibleMessage === "string"
+        ? details.visibleMessage
+        : typeof details?.sessionName === "string"
+          ? startedVisibleMessage(details.sessionName)
+          : "Started and attached to tmux session.";
+      return new Text(theme.fg("success", message), 0, 0);
     },
   });
 }
