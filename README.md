@@ -15,7 +15,6 @@ https://github.com/user-attachments/assets/b4ec6d34-fd8a-4254-bf74-e216779649f6
 - Adds `/live-terminal:run`, `/live-terminal:attach`, `/live-terminal:focus`, and `/live-terminal:close` commands.
 - Adds shortcuts:
   - `ctrl+shift+f` — focus the tmux session in a full-screen interactive modal; press it again to close the modal
-  - `esc` — close the focused modal
   - `ctrl+shift+x` — detach and kill the tmux session
   - `ctrl+shift+v` — detach without killing the tmux session; after completion, close the widget
 

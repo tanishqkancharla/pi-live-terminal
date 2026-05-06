@@ -326,7 +326,7 @@ class TmuxFocusModal implements Component {
   }
 
   handleInput(data: string): void {
-    if (matchesKey(data, Key.ctrlShift("f")) || matchesKey(data, Key.escape)) {
+    if (matchesKey(data, Key.ctrlShift("f"))) {
       this.done();
       return;
     }
@@ -390,7 +390,6 @@ class TmuxFocusModal implements Component {
       result.push(border("│") + pad("") + border("│"));
 
     const hints = [
-      shortcut(" esc ") + dim("close"),
       shortcut(" ctrl+shift+f ") + dim("close focus"),
       dim("input is sent to tmux"),
     ].join(border(" · "));
