@@ -1,3 +1,6 @@
+<img width="1536" height="768" alt="tanishqk_Overhead_aerial_view_of_New_York_City_at_golden_hour_930c0139-1e36-41a0-843f-aec63532c8f2_3" src="https://github.com/user-attachments/assets/97aede62-43ec-42b6-9056-93e20be7dd7f" />
+
+
 # pi-live-terminal
 
 Pi extension that adds a `run_live_terminal` tool and a live tmux widget inside Pi.
