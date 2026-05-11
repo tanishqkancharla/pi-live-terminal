@@ -838,15 +838,14 @@ export default function (pi: ExtensionAPI) {
     const sessionName = safeSessionName(options.sessionName);
     const title = options.title || options.sessionName || compactText(command, 48) || DEFAULT_TITLE;
     const cwd = ctx.cwd || process.cwd();
-    const wrappedCommand = `bash -lc ${shellQuote(`${command}
+    const shellCommand = `bash -lc ${shellQuote(`${command}
 status=$?
 printf '\n[Session exited with status %s]\n' "$status"
-tmux set-option -p -t "$TMUX_PANE" @pi_tmux_run_status "$status" 2>/dev/null || true
-sleep 300`)}`;
+tmux set-option -p -t "$TMUX_PANE" @pi_tmux_run_status "$status" 2>/dev/null || true`)}`;
 
     execFileSync(
       "tmux",
-      ["new-session", "-d", "-s", sessionName, "-c", cwd, wrappedCommand],
+      ["new-session", "-d", "-s", sessionName, "-c", cwd],
       {
         encoding: "utf8",
       },
@@ -854,6 +853,8 @@ sleep 300`)}`;
 
     const paneId = await tmux(["display-message", "-p", "-t", sessionName, "#{pane_id}"]);
     const target = paneId.trim() || sessionName;
+    await tmux(["send-keys", "-t", target, "-l", shellCommand]);
+    await tmux(["send-keys", "-t", target, "Enter"]);
 
     if (ctx.hasUI) {
       showWidget(ctx, { target, sessionName, title, command, cwd, state: "running" });
