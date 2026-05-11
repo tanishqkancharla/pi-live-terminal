@@ -842,7 +842,10 @@ export default function (pi: ExtensionAPI) {
 status=$?
 printf '\n[Session exited with status %s]\n' "$status"
 tmux set-option -p -t "$TMUX_PANE" @pi_tmux_run_status "$status" 2>/dev/null || true
-sleep 300`)}`;
+if [ -n "\${SHELL:-}" ] && [ -x "$SHELL" ]; then
+  exec "$SHELL" -i
+fi
+exec /bin/bash -i`)}`;
 
     execFileSync(
       "tmux",
