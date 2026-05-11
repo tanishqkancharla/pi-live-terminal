@@ -17,6 +17,8 @@ const WIDGET_ID = "pi-live-terminal";
 const ENTRY_TYPE = "pi-live-terminal";
 const DEFAULT_TITLE = "tmux";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const ENABLE_MOUSE_REPORTING = "\x1b[?1000h\x1b[?1006h";
+const DISABLE_MOUSE_REPORTING = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
 type LiveTerminalAttachment = {
   target: string;
@@ -179,7 +181,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 function enableMouseReporting(): void {
   if (!process.stdout.isTTY) return;
   if (mouseReportingRefCount++ === 0) {
-    process.stdout.write("\x1b[?1000h\x1b[?1006h");
+    process.stdout.write(ENABLE_MOUSE_REPORTING);
   }
 }
 
@@ -187,8 +189,13 @@ function disableMouseReporting(): void {
   if (!process.stdout.isTTY || mouseReportingRefCount === 0) return;
   mouseReportingRefCount--;
   if (mouseReportingRefCount === 0) {
-    process.stdout.write("\x1b[?1006l\x1b[?1000l");
+    process.stdout.write(DISABLE_MOUSE_REPORTING);
   }
+}
+
+function resetMouseReporting(): void {
+  mouseReportingRefCount = 0;
+  if (process.stdout.isTTY) process.stdout.write(DISABLE_MOUSE_REPORTING);
 }
 
 function parseSgrMouse(data: string): { button: number; x: number; y: number } | undefined {
@@ -199,6 +206,14 @@ function parseSgrMouse(data: string): { button: number; x: number; y: number } |
     x: Number(match[2]),
     y: Number(match[3]),
   };
+}
+
+function translateSgrMouse(data: string, columnOffset: number, rowOffset: number): string {
+  const match = data.match(/^(\x1b\[<\d+;)(\d+);(\d+)([Mm])$/);
+  if (!match) return data;
+  const x = Math.max(1, Number(match[2]) - columnOffset);
+  const y = Math.max(1, Number(match[3]) - rowOffset);
+  return `${match[1]}${x};${y}${match[4]}`;
 }
 
 function wheelScrollDelta(data: string): number | undefined {
@@ -217,6 +232,71 @@ function maxScrollOffset(lineCount: number, visibleLines: number): number {
 
 function clampScrollOffset(offset: number, lineCount: number, visibleLines: number): number {
   return Math.min(Math.max(0, offset), maxScrollOffset(lineCount, visibleLines));
+}
+
+function findStringTerminator(input: string, start: number): number {
+  for (let index = start; index < input.length; index++) {
+    if (input.charCodeAt(index) === 0x07) return index + 1;
+    if (input[index] === "\x1b" && input[index + 1] === "\\") return index + 2;
+  }
+  return -1;
+}
+
+function findCsiTerminator(input: string, start: number): number {
+  for (let index = start; index < input.length; index++) {
+    const code = input.charCodeAt(index);
+    if (code >= 0x40 && code <= 0x7e) return index;
+  }
+  return -1;
+}
+
+function sanitizeTerminalOutput(input: string): string {
+  const source = input;
+  let output = "";
+
+  for (let index = 0; index < source.length;) {
+    const code = source.charCodeAt(index);
+
+    if (source[index] === "\x1b") {
+      if (index + 1 >= source.length) {
+        break;
+      }
+
+      const next = source[index + 1];
+      if (next === "[") {
+        const end = findCsiTerminator(source, index + 2);
+        if (end === -1) break;
+        if (source[end] === "m") output += source.slice(index, end + 1);
+        index = end + 1;
+        continue;
+      }
+
+      if (next === "]" || next === "P" || next === "_" || next === "^" || next === "X") {
+        const end = findStringTerminator(source, index + 2);
+        if (end === -1) break;
+        index = end;
+        continue;
+      }
+
+      if ("()*+-./#".includes(next)) {
+        index += 3;
+        continue;
+      }
+
+      index += 2;
+      continue;
+    }
+
+    if ((code < 32 && source[index] !== "\n" && source[index] !== "\t") || code === 127 || (code >= 0x80 && code <= 0x9f)) {
+      index++;
+      continue;
+    }
+
+    output += source[index];
+    index++;
+  }
+
+  return output;
 }
 
 function tmux(args: string[]): Promise<string> {
@@ -463,6 +543,7 @@ class LiveTerminalWidget implements Component {
   private scrollOffset = 0;
   private lastResize = "";
   private unsubscribeStream?: () => Promise<void>;
+  private captureTimer?: NodeJS.Timeout;
 
   constructor(
     private tui: TUI,
@@ -477,20 +558,8 @@ class LiveTerminalWidget implements Component {
 
   private async initialize(): Promise<void> {
     try {
-      const output = await tmux([
-        "capture-pane",
-        "-p",
-        "-e",
-        "-J",
-        "-S",
-        `-${CAPTURE_LINES}`,
-        "-t",
-        this.target,
-      ]);
-      this.lines = output.replace(/\s+$/g, "").split("\n");
-      this.pendingLine = "";
-      this.error = undefined;
-      this.unsubscribeStream = await subscribePaneOutput(this.target, (chunk) => this.appendChunk(chunk));
+      await this.refreshPaneText();
+      this.unsubscribeStream = await subscribePaneOutput(this.target, () => this.schedulePaneRefresh());
       await this.refreshStatus();
       this.scrollOffset = maxScrollOffset(this.lineCount(), VISIBLE_LINES);
     } catch (error) {
@@ -501,30 +570,40 @@ class LiveTerminalWidget implements Component {
     this.tui.requestRender();
   }
 
-  private lineCount(): number {
-    return this.lines.length + (this.pendingLine ? 1 : 0);
+  private schedulePaneRefresh(): void {
+    if (this.captureTimer) return;
+    this.captureTimer = setTimeout(() => {
+      this.captureTimer = undefined;
+      void this.refreshPaneText().catch((error) => {
+        this.error = error instanceof Error ? error.message : String(error);
+        this.tui.requestRender();
+      });
+    }, 50);
   }
 
-  private appendChunk(chunk: string): void {
+  private async refreshPaneText(): Promise<void> {
     const wasAtBottom = this.scrollOffset >= maxScrollOffset(this.lineCount(), VISIBLE_LINES);
-    const normalized = chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const parts = normalized.split("\n");
-
-    this.pendingLine += parts.shift() || "";
-    for (const part of parts) {
-      this.lines.push(this.pendingLine);
-      this.pendingLine = part;
-    }
-
-    if (this.lines.length > CAPTURE_LINES) {
-      this.lines = this.lines.slice(this.lines.length - CAPTURE_LINES);
-    }
-
+    const output = await tmux([
+      "capture-pane",
+      "-p",
+      "-e",
+      "-J",
+      "-S",
+      `-${CAPTURE_LINES}`,
+      "-t",
+      this.target,
+    ]);
+    this.lines = sanitizeTerminalOutput(output).replace(/\s+$/g, "").split("\n");
+    this.pendingLine = "";
+    this.error = undefined;
     this.scrollOffset = wasAtBottom
       ? maxScrollOffset(this.lineCount(), VISIBLE_LINES)
       : clampScrollOffset(this.scrollOffset, this.lineCount(), VISIBLE_LINES);
-    this.error = undefined;
     this.tui.requestRender();
+  }
+
+  private lineCount(): number {
+    return this.lines.length + (this.pendingLine ? 1 : 0);
   }
 
   private async refreshStatus(): Promise<void> {
@@ -625,6 +704,7 @@ class LiveTerminalWidget implements Component {
 
   dispose(): void {
     clearInterval(this.timer);
+    if (this.captureTimer) clearTimeout(this.captureTimer);
     if (this.unsubscribeStream) {
       void this.unsubscribeStream().catch(() => {});
       this.unsubscribeStream = undefined;
@@ -642,6 +722,7 @@ class TmuxFocusModal implements Component {
   private scrollOffset = 0;
   private lastResize = "";
   private unsubscribeStream?: () => Promise<void>;
+  private captureTimer?: NodeJS.Timeout;
 
   constructor(
     private tui: TUI,
@@ -662,20 +743,8 @@ class TmuxFocusModal implements Component {
 
   private async initialize(): Promise<void> {
     try {
-      const output = await tmux([
-        "capture-pane",
-        "-p",
-        "-e",
-        "-J",
-        "-S",
-        `-${CAPTURE_LINES}`,
-        "-t",
-        this.target,
-      ]);
-      this.lines = output.replace(/\s+$/g, "").split("\n");
-      this.pendingLine = "";
-      this.error = undefined;
-      this.unsubscribeStream = await subscribePaneOutput(this.target, (chunk) => this.appendChunk(chunk));
+      await this.refreshPaneText();
+      this.unsubscribeStream = await subscribePaneOutput(this.target, () => this.schedulePaneRefresh());
       await this.refreshStatus();
       this.scrollOffset = maxScrollOffset(this.lineCount(), this.visibleLines());
     } catch (error) {
@@ -686,31 +755,41 @@ class TmuxFocusModal implements Component {
     this.tui.requestRender();
   }
 
-  private lineCount(): number {
-    return this.lines.length + (this.pendingLine ? 1 : 0);
+  private schedulePaneRefresh(): void {
+    if (this.captureTimer) return;
+    this.captureTimer = setTimeout(() => {
+      this.captureTimer = undefined;
+      void this.refreshPaneText().catch((error) => {
+        this.error = error instanceof Error ? error.message : String(error);
+        this.tui.requestRender();
+      });
+    }, 50);
   }
 
-  private appendChunk(chunk: string): void {
+  private async refreshPaneText(): Promise<void> {
     const visibleLines = this.visibleLines();
     const wasAtBottom = this.scrollOffset >= maxScrollOffset(this.lineCount(), visibleLines);
-    const normalized = chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const parts = normalized.split("\n");
-
-    this.pendingLine += parts.shift() || "";
-    for (const part of parts) {
-      this.lines.push(this.pendingLine);
-      this.pendingLine = part;
-    }
-
-    if (this.lines.length > CAPTURE_LINES) {
-      this.lines = this.lines.slice(this.lines.length - CAPTURE_LINES);
-    }
-
+    const output = await tmux([
+      "capture-pane",
+      "-p",
+      "-e",
+      "-J",
+      "-S",
+      `-${CAPTURE_LINES}`,
+      "-t",
+      this.target,
+    ]);
+    this.lines = sanitizeTerminalOutput(output).replace(/\s+$/g, "").split("\n");
+    this.pendingLine = "";
+    this.error = undefined;
     this.scrollOffset = wasAtBottom
       ? maxScrollOffset(this.lineCount(), visibleLines)
       : clampScrollOffset(this.scrollOffset, this.lineCount(), visibleLines);
-    this.error = undefined;
     this.tui.requestRender();
+  }
+
+  private lineCount(): number {
+    return this.lines.length + (this.pendingLine ? 1 : 0);
   }
 
   private async refreshStatus(): Promise<void> {
@@ -728,18 +807,9 @@ class TmuxFocusModal implements Component {
   }
 
   handleInput(data: string): void {
-    const delta = wheelScrollDelta(data);
-    if (delta !== undefined) {
-      this.scrollOffset = clampScrollOffset(
-        this.scrollOffset + delta,
-        this.lineCount(),
-        this.visibleLines(),
-      );
-      this.tui.requestRender();
-      return;
+    if (parseSgrMouse(data)) {
+      data = translateSgrMouse(data, CONTENT_PADDING + 1, 1);
     }
-
-    if (parseSgrMouse(data)) return;
 
     if (matchesKey(data, Key.ctrlShift("f"))) {
       this.done();
@@ -808,7 +878,7 @@ class TmuxFocusModal implements Component {
 
     const hints = [
       shortcut(" ctrl+shift+f ") + dim("close focus"),
-      dim("scroll wheel scrolls output"),
+      dim("mouse input is sent to tmux"),
       dim("input is sent to tmux"),
     ].join(border(" · "));
     const hintsWidth = visibleWidth(hints);
@@ -822,6 +892,7 @@ class TmuxFocusModal implements Component {
   dispose(): void {
     disableMouseReporting();
     clearInterval(this.timer);
+    if (this.captureTimer) clearTimeout(this.captureTimer);
     if (this.unsubscribeStream) {
       void this.unsubscribeStream().catch(() => {});
       this.unsubscribeStream = undefined;
@@ -830,6 +901,8 @@ class TmuxFocusModal implements Component {
 }
 
 export default function (pi: ExtensionAPI) {
+  resetMouseReporting();
+
   async function startLiveTerminal(
     ctx: { cwd?: string; hasUI?: boolean },
     command: string,
@@ -1024,6 +1097,8 @@ exec /bin/bash -i`)}`;
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    resetMouseReporting();
+
     let attachment: LiveTerminalAttachment | undefined;
     for (const entry of ctx.sessionManager.getEntries()) {
       if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
