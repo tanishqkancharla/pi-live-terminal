@@ -4,10 +4,13 @@ import { Key, Text, decodeKittyPrintable, matchesKey, parseKey, truncateToWidth,
 import { Type } from "typebox";
 import { execFile, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { createReadStream, promises as fs } from "node:fs";
+import type { ReadStream } from "node:fs";
 
 const CAPTURE_LINES = 200;
 const VISIBLE_LINES = 16;
 const POLL_MS = 500;
+const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const CONTENT_PADDING = 1;
 const WHEEL_SCROLL_LINES = 3;
 const WIDGET_ID = "pi-live-terminal";
@@ -25,10 +28,42 @@ type LiveTerminalAttachment = {
   status?: string;
 };
 
+type WaitForOptions = {
+  regex?: string;
+  event?: "exit" | "target_closed";
+  ignore_case?: boolean;
+  timeout_ms?: number;
+  poll_ms?: number;
+};
+
+type WaitCondition =
+  | { kind: "regex"; regex: RegExp; source: string }
+  | { kind: "event"; event: "exit" | "target_closed" };
+
+type WaitResult = {
+  matched: boolean;
+  timedOut?: boolean;
+  condition: string;
+  elapsedMs: number;
+  status?: string;
+  match?: string;
+};
+
+type PaneSubscriber = (chunk: string) => void;
+
+type PaneStream = {
+  target: string;
+  fifoPath: string;
+  stream: ReadStream;
+  subscribers: Set<PaneSubscriber>;
+};
+
 let currentAttachment: LiveTerminalAttachment | undefined;
 let focusModalOpen = false;
 const reportedExitTargets = new Set<string>();
 let mouseReportingRefCount = 0;
+const paneStreams = new Map<string, PaneStream>();
+const paneStreamCreates = new Map<string, Promise<PaneStream>>();
 
 function safeSessionName(input?: string): string {
   const base = (input || `pi-live-${randomBytes(4).toString("hex")}`)
@@ -54,6 +89,10 @@ function startedVisibleMessage(sessionName: string): string {
   return startedMessage(sessionName);
 }
 
+function attachedMessage(sessionName: string | undefined, target: string): string {
+  return `Attached to tmux session ${sessionName || target}.`;
+}
+
 function attachmentName(attachment: LiveTerminalAttachment): string {
   return attachment.sessionName || attachment.title || attachment.target;
 }
@@ -61,6 +100,80 @@ function attachmentName(attachment: LiveTerminalAttachment): string {
 function statusGlyph(state: "running" | "completed" | "unknown", status?: string): string {
   if (state === "completed") return status === "0" ? "🟢" : "🔴";
   return SPINNER_FRAMES[Math.floor(Date.now() / POLL_MS) % SPINNER_FRAMES.length];
+}
+
+function waitDescription(condition: WaitCondition): string {
+  return condition.kind === "regex"
+    ? `regex ${JSON.stringify(condition.source)}`
+    : `event ${condition.event}`;
+}
+
+function waitResultMessage(result: WaitResult): string {
+  if (result.timedOut) return `Timed out after ${result.elapsedMs}ms waiting for ${result.condition}.`;
+  if (result.status !== undefined) return `Matched ${result.condition} with status ${result.status} after ${result.elapsedMs}ms.`;
+  if (result.match !== undefined) return `Matched ${result.condition} after ${result.elapsedMs}ms: ${compactText(result.match, 120)}`;
+  return `Matched ${result.condition} after ${result.elapsedMs}ms.`;
+}
+
+function waitForRenderSummary(waitFor: unknown): string | undefined {
+  if (!waitFor || typeof waitFor !== "object") return undefined;
+  const value = waitFor as { regex?: unknown; event?: unknown; ignore_case?: unknown };
+  if (typeof value.regex === "string") {
+    const flags = value.ignore_case ? "im" : "m";
+    return `/${value.regex}/${flags}`;
+  }
+  if (typeof value.event === "string") return `event:${value.event}`;
+  return undefined;
+}
+
+function positiveNumber(value: number | undefined, defaultValue: number, name: string): number {
+  const result = value ?? defaultValue;
+  if (!Number.isFinite(result) || result <= 0) throw new Error(`${name} must be a positive number.`);
+  return result;
+}
+
+function parseWaitFor(waitFor: WaitForOptions): { condition: WaitCondition; timeoutMs: number; pollMs: number } {
+  const hasRegex = typeof waitFor.regex === "string" && waitFor.regex.length > 0;
+  const hasEvent = typeof waitFor.event === "string";
+  if (hasRegex === hasEvent) throw new Error("wait_for must include exactly one of regex or event.");
+
+  const timeoutMs = positiveNumber(waitFor.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS, "wait_for.timeout_ms");
+  const pollMs = positiveNumber(waitFor.poll_ms, POLL_MS, "wait_for.poll_ms");
+
+  if (hasEvent) {
+    if (waitFor.event !== "exit" && waitFor.event !== "target_closed") {
+      throw new Error("wait_for.event must be 'exit' or 'target_closed'.");
+    }
+    return { condition: { kind: "event", event: waitFor.event }, timeoutMs, pollMs };
+  }
+
+  try {
+    const flags = waitFor.ignore_case ? "im" : "m";
+    return { condition: { kind: "regex", regex: new RegExp(waitFor.regex!, flags), source: waitFor.regex! }, timeoutMs, pollMs };
+  } catch (error) {
+    throw new Error(`Invalid wait_for.regex: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("Wait aborted."));
+      return;
+    }
+
+    const timer = setTimeout(done, ms);
+    function done() {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }
+    function abort() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(new Error("Wait aborted."));
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 function enableMouseReporting(): void {
@@ -118,6 +231,86 @@ function tmux(args: string[]): Promise<string> {
   });
 }
 
+function runCommand(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(stderr.trim() || error.message));
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+async function createPaneStream(target: string): Promise<PaneStream> {
+  try {
+    const fifoPath = `/tmp/pi-live-terminal-${process.pid}-${randomBytes(6).toString("hex")}.fifo`;
+    await runCommand("mkfifo", [fifoPath]);
+
+    const stream = createReadStream(fifoPath, { encoding: "utf8" });
+    const paneStream: PaneStream = {
+      target,
+      fifoPath,
+      stream,
+      subscribers: new Set(),
+    };
+
+    stream.on("data", (chunk) => {
+      for (const subscriber of paneStream.subscribers) subscriber(chunk);
+    });
+
+    stream.on("error", () => {
+      void closePaneStream(target).catch(() => {});
+    });
+
+    try {
+      await tmux(["pipe-pane", "-O", "-t", target, `cat > ${shellQuote(fifoPath)}`]);
+    } catch (error) {
+      stream.destroy();
+      await fs.unlink(fifoPath).catch(() => {});
+      throw error;
+    }
+
+    paneStreams.set(target, paneStream);
+    paneStreamCreates.delete(target);
+    return paneStream;
+  } catch (error) {
+    paneStreamCreates.delete(target);
+    throw error;
+  }
+}
+
+async function closePaneStream(target: string): Promise<void> {
+  const paneStream = paneStreams.get(target);
+  if (!paneStream) return;
+
+  paneStreams.delete(target);
+  paneStreamCreates.delete(target);
+  await tmux(["pipe-pane", "-t", target]).catch(() => {});
+  paneStream.stream.destroy();
+  await fs.unlink(paneStream.fifoPath).catch(() => {});
+}
+
+async function subscribePaneOutput(target: string, subscriber: PaneSubscriber): Promise<() => Promise<void>> {
+  let paneStream = paneStreams.get(target);
+  if (!paneStream) {
+    const pending = paneStreamCreates.get(target) ?? createPaneStream(target);
+    paneStreamCreates.set(target, pending);
+    paneStream = await pending;
+  }
+  paneStream.subscribers.add(subscriber);
+
+  return async () => {
+    const active = paneStreams.get(target);
+    if (!active) return;
+    active.subscribers.delete(subscriber);
+    if (active.subscribers.size === 0) {
+      await closePaneStream(target);
+    }
+  };
+}
+
 function sendTmuxInput(target: string, data: string): Promise<string> {
   const printable = decodeKittyPrintable(data) ?? (isPrintableText(data) ? data : undefined);
   if (printable !== undefined) {
@@ -131,6 +324,82 @@ function sendTmuxInput(target: string, data: string): Promise<string> {
   }
 
   return tmux(["send-keys", "-t", target, "-l", data]);
+}
+
+async function getTmuxTargetInfo(target: string): Promise<{ target: string; sessionName?: string }> {
+  const output = await tmux(["list-panes", "-t", target, "-F", "#{pane_id}\t#{session_name}"]);
+  const [paneId, sessionName] = output.trim().split("\n")[0]?.split("\t") ?? [];
+  if (!paneId) throw new Error(`Could not resolve tmux target ${target}.`);
+  return { target: paneId, sessionName: sessionName || undefined };
+}
+
+async function tmuxTargetExists(target: string): Promise<boolean> {
+  if (target.startsWith("%")) {
+    const panes = await tmux(["list-panes", "-a", "-F", "#{pane_id}"]).catch(() => "");
+    return panes.split("\n").includes(target);
+  }
+
+  try {
+    await tmux(["list-panes", "-t", target, "-F", "#{pane_id}"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getExitStatus(target: string): Promise<string | undefined> {
+  const status = await tmux([
+    "show-option",
+    "-p",
+    "-qv",
+    "-t",
+    target,
+    "@pi_tmux_run_status",
+  ]).catch(() => "");
+  return status.trim() || undefined;
+}
+
+async function capturePaneText(target: string): Promise<string> {
+  return tmux([
+    "capture-pane",
+    "-p",
+    "-J",
+    "-S",
+    `-${CAPTURE_LINES}`,
+    "-t",
+    target,
+  ]);
+}
+
+async function waitForTerminal(target: string, waitFor: WaitForOptions, signal?: AbortSignal): Promise<WaitResult> {
+  const { condition, timeoutMs, pollMs } = parseWaitFor(waitFor);
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  const description = waitDescription(condition);
+
+  while (true) {
+    if (condition.kind === "event" && condition.event === "target_closed") {
+      if (!(await tmuxTargetExists(target))) {
+        return { matched: true, condition: description, elapsedMs: Date.now() - startedAt };
+      }
+    } else if (condition.kind === "event" && condition.event === "exit") {
+      const status = await getExitStatus(target);
+      if (status !== undefined) {
+        return { matched: true, condition: description, status, elapsedMs: Date.now() - startedAt };
+      }
+    } else if (condition.kind === "regex") {
+      const match = (await capturePaneText(target)).match(condition.regex);
+      if (match) {
+        return { matched: true, condition: description, match: match[0], elapsedMs: Date.now() - startedAt };
+      }
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      return { matched: false, timedOut: true, condition: description, elapsedMs: Date.now() - startedAt };
+    }
+    await sleep(Math.min(pollMs, remainingMs), signal);
+  }
 }
 
 function isPrintableText(data: string): boolean {
@@ -186,12 +455,14 @@ function toTmuxKey(key: string): string | undefined {
 
 class LiveTerminalWidget implements Component {
   private lines: string[] = [];
+  private pendingLine = "";
   private error: string | undefined;
   private state: "running" | "completed" | "unknown" = "unknown";
   private exitStatus: string | undefined;
   private timer: NodeJS.Timeout;
   private scrollOffset = 0;
   private lastResize = "";
+  private unsubscribeStream?: () => Promise<void>;
 
   constructor(
     private tui: TUI,
@@ -200,11 +471,11 @@ class LiveTerminalWidget implements Component {
     private title: string = DEFAULT_TITLE,
     private onExit?: (status: string) => void,
   ) {
-    this.timer = setInterval(() => void this.refresh(), POLL_MS);
-    void this.refresh();
+    this.timer = setInterval(() => void this.refreshStatus(), POLL_MS);
+    void this.initialize();
   }
 
-  private async refresh(): Promise<void> {
+  private async initialize(): Promise<void> {
     try {
       const output = await tmux([
         "capture-pane",
@@ -216,25 +487,54 @@ class LiveTerminalWidget implements Component {
         "-t",
         this.target,
       ]);
-      const status = await tmux([
-        "show-option",
-        "-p",
-        "-qv",
-        "-t",
-        this.target,
-        "@pi_tmux_run_status",
-      ]).catch(() => "");
-      const exitStatus = status.trim();
-      const wasCompleted = this.state === "completed";
-      const wasAtBottom = this.scrollOffset >= maxScrollOffset(this.lines.length, VISIBLE_LINES);
       this.lines = output.replace(/\s+$/g, "").split("\n");
+      this.pendingLine = "";
       this.error = undefined;
-      this.exitStatus = exitStatus || undefined;
+      this.unsubscribeStream = await subscribePaneOutput(this.target, (chunk) => this.appendChunk(chunk));
+      await this.refreshStatus();
+      this.scrollOffset = maxScrollOffset(this.lineCount(), VISIBLE_LINES);
+    } catch (error) {
+      this.error = error instanceof Error ? error.message : String(error);
+      this.tui.requestRender();
+      return;
+    }
+    this.tui.requestRender();
+  }
+
+  private lineCount(): number {
+    return this.lines.length + (this.pendingLine ? 1 : 0);
+  }
+
+  private appendChunk(chunk: string): void {
+    const wasAtBottom = this.scrollOffset >= maxScrollOffset(this.lineCount(), VISIBLE_LINES);
+    const normalized = chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const parts = normalized.split("\n");
+
+    this.pendingLine += parts.shift() || "";
+    for (const part of parts) {
+      this.lines.push(this.pendingLine);
+      this.pendingLine = part;
+    }
+
+    if (this.lines.length > CAPTURE_LINES) {
+      this.lines = this.lines.slice(this.lines.length - CAPTURE_LINES);
+    }
+
+    this.scrollOffset = wasAtBottom
+      ? maxScrollOffset(this.lineCount(), VISIBLE_LINES)
+      : clampScrollOffset(this.scrollOffset, this.lineCount(), VISIBLE_LINES);
+    this.error = undefined;
+    this.tui.requestRender();
+  }
+
+  private async refreshStatus(): Promise<void> {
+    try {
+      const exitStatus = await getExitStatus(this.target);
+      const wasCompleted = this.state === "completed";
+      this.exitStatus = exitStatus;
       this.state = exitStatus ? "completed" : "running";
       if (exitStatus && !wasCompleted) this.onExit?.(exitStatus);
-      this.scrollOffset = wasAtBottom
-        ? maxScrollOffset(this.lines.length, VISIBLE_LINES)
-        : clampScrollOffset(this.scrollOffset, this.lines.length, VISIBLE_LINES);
+      this.scrollOffset = clampScrollOffset(this.scrollOffset, this.lineCount(), VISIBLE_LINES);
     } catch (error) {
       this.error = error instanceof Error ? error.message : String(error);
     }
@@ -247,7 +547,7 @@ class LiveTerminalWidget implements Component {
 
     this.scrollOffset = clampScrollOffset(
       this.scrollOffset + delta,
-      this.lines.length,
+      this.lineCount(),
       VISIBLE_LINES,
     );
     this.tui.requestRender();
@@ -293,7 +593,9 @@ class LiveTerminalWidget implements Component {
 
     const body = this.error
       ? [th.fg("error", `tmux: ${this.error}`)]
-      : this.lines;
+      : this.pendingLine
+        ? [...this.lines, this.pendingLine]
+        : this.lines;
     const visible = body.slice(
       this.scrollOffset,
       this.scrollOffset + VISIBLE_LINES,
@@ -323,17 +625,23 @@ class LiveTerminalWidget implements Component {
 
   dispose(): void {
     clearInterval(this.timer);
+    if (this.unsubscribeStream) {
+      void this.unsubscribeStream().catch(() => {});
+      this.unsubscribeStream = undefined;
+    }
   }
 }
 
 class TmuxFocusModal implements Component {
   private lines: string[] = [];
+  private pendingLine = "";
   private error: string | undefined;
   private state: "running" | "completed" | "unknown" = "unknown";
   private exitStatus: string | undefined;
   private timer: NodeJS.Timeout;
   private scrollOffset = 0;
   private lastResize = "";
+  private unsubscribeStream?: () => Promise<void>;
 
   constructor(
     private tui: TUI,
@@ -344,17 +652,16 @@ class TmuxFocusModal implements Component {
     private onExit?: (status: string) => void,
   ) {
     enableMouseReporting();
-    this.timer = setInterval(() => void this.refresh(), POLL_MS);
-    void this.refresh();
+    this.timer = setInterval(() => void this.refreshStatus(), POLL_MS);
+    void this.initialize();
   }
 
   private visibleLines(): number {
     return Math.max(1, this.tui.terminal.rows - 2);
   }
 
-  private async refresh(): Promise<void> {
+  private async initialize(): Promise<void> {
     try {
-      const visibleLines = this.visibleLines();
       const output = await tmux([
         "capture-pane",
         "-p",
@@ -365,25 +672,55 @@ class TmuxFocusModal implements Component {
         "-t",
         this.target,
       ]);
-      const status = await tmux([
-        "show-option",
-        "-p",
-        "-qv",
-        "-t",
-        this.target,
-        "@pi_tmux_run_status",
-      ]).catch(() => "");
-      const exitStatus = status.trim();
-      const wasCompleted = this.state === "completed";
-      const wasAtBottom = this.scrollOffset >= maxScrollOffset(this.lines.length, visibleLines);
       this.lines = output.replace(/\s+$/g, "").split("\n");
+      this.pendingLine = "";
       this.error = undefined;
-      this.exitStatus = exitStatus || undefined;
+      this.unsubscribeStream = await subscribePaneOutput(this.target, (chunk) => this.appendChunk(chunk));
+      await this.refreshStatus();
+      this.scrollOffset = maxScrollOffset(this.lineCount(), this.visibleLines());
+    } catch (error) {
+      this.error = error instanceof Error ? error.message : String(error);
+      this.tui.requestRender();
+      return;
+    }
+    this.tui.requestRender();
+  }
+
+  private lineCount(): number {
+    return this.lines.length + (this.pendingLine ? 1 : 0);
+  }
+
+  private appendChunk(chunk: string): void {
+    const visibleLines = this.visibleLines();
+    const wasAtBottom = this.scrollOffset >= maxScrollOffset(this.lineCount(), visibleLines);
+    const normalized = chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const parts = normalized.split("\n");
+
+    this.pendingLine += parts.shift() || "";
+    for (const part of parts) {
+      this.lines.push(this.pendingLine);
+      this.pendingLine = part;
+    }
+
+    if (this.lines.length > CAPTURE_LINES) {
+      this.lines = this.lines.slice(this.lines.length - CAPTURE_LINES);
+    }
+
+    this.scrollOffset = wasAtBottom
+      ? maxScrollOffset(this.lineCount(), visibleLines)
+      : clampScrollOffset(this.scrollOffset, this.lineCount(), visibleLines);
+    this.error = undefined;
+    this.tui.requestRender();
+  }
+
+  private async refreshStatus(): Promise<void> {
+    try {
+      const exitStatus = await getExitStatus(this.target);
+      const wasCompleted = this.state === "completed";
+      this.exitStatus = exitStatus;
       this.state = exitStatus ? "completed" : "running";
       if (exitStatus && !wasCompleted) this.onExit?.(exitStatus);
-      this.scrollOffset = wasAtBottom
-        ? maxScrollOffset(this.lines.length, visibleLines)
-        : clampScrollOffset(this.scrollOffset, this.lines.length, visibleLines);
+      this.scrollOffset = clampScrollOffset(this.scrollOffset, this.lineCount(), this.visibleLines());
     } catch (error) {
       this.error = error instanceof Error ? error.message : String(error);
     }
@@ -395,7 +732,7 @@ class TmuxFocusModal implements Component {
     if (delta !== undefined) {
       this.scrollOffset = clampScrollOffset(
         this.scrollOffset + delta,
-        this.lines.length,
+        this.lineCount(),
         this.visibleLines(),
       );
       this.tui.requestRender();
@@ -410,7 +747,7 @@ class TmuxFocusModal implements Component {
     }
 
     void sendTmuxInput(this.target, data)
-      .then(() => this.refresh())
+      .then(() => this.tui.requestRender())
       .catch((error) => {
         this.error = error instanceof Error ? error.message : String(error);
         this.tui.requestRender();
@@ -457,7 +794,9 @@ class TmuxFocusModal implements Component {
 
     const body = this.error
       ? [th.fg("error", `tmux: ${this.error}`)]
-      : this.lines;
+      : this.pendingLine
+        ? [...this.lines, this.pendingLine]
+        : this.lines;
     const visible = body.slice(
       this.scrollOffset,
       this.scrollOffset + visibleLines,
@@ -483,6 +822,10 @@ class TmuxFocusModal implements Component {
   dispose(): void {
     disableMouseReporting();
     clearInterval(this.timer);
+    if (this.unsubscribeStream) {
+      void this.unsubscribeStream().catch(() => {});
+      this.unsubscribeStream = undefined;
+    }
   }
 }
 
@@ -495,15 +838,14 @@ export default function (pi: ExtensionAPI) {
     const sessionName = safeSessionName(options.sessionName);
     const title = options.title || options.sessionName || compactText(command, 48) || DEFAULT_TITLE;
     const cwd = ctx.cwd || process.cwd();
-    const wrappedCommand = `bash -lc ${shellQuote(`${command}
+    const shellCommand = `bash -lc ${shellQuote(`${command}
 status=$?
 printf '\n[Session exited with status %s]\n' "$status"
-tmux set-option -p -t "$TMUX_PANE" @pi_tmux_run_status "$status" 2>/dev/null || true
-sleep 300`)}`;
+tmux set-option -p -t "$TMUX_PANE" @pi_tmux_run_status "$status" 2>/dev/null || true`)}`;
 
     execFileSync(
       "tmux",
-      ["new-session", "-d", "-s", sessionName, "-c", cwd, wrappedCommand],
+      ["new-session", "-d", "-s", sessionName, "-c", cwd],
       {
         encoding: "utf8",
       },
@@ -511,6 +853,8 @@ sleep 300`)}`;
 
     const paneId = await tmux(["display-message", "-p", "-t", sessionName, "#{pane_id}"]);
     const target = paneId.trim() || sessionName;
+    await tmux(["send-keys", "-t", target, "-l", shellCommand]);
+    await tmux(["send-keys", "-t", target, "Enter"]);
 
     if (ctx.hasUI) {
       showWidget(ctx, { target, sessionName, title, command, cwd, state: "running" });
@@ -519,6 +863,19 @@ sleep 300`)}`;
     pi.appendEntry(ENTRY_TYPE, { action: "open", target, sessionName, title, command, cwd, state: "running", at: Date.now() });
 
     return { sessionName, target, title, command, cwd };
+  }
+
+  async function attachLiveTerminal(
+    ctx: { hasUI?: boolean },
+    target: string,
+    options: { title?: string } = {},
+  ) {
+    const info = await getTmuxTargetInfo(target);
+    const title = options.title || info.sessionName || target;
+    const attachment = { target: info.target, sessionName: info.sessionName, title, state: "running" as const };
+    showWidget(ctx, attachment);
+    pi.appendEntry(ENTRY_TYPE, { action: "open", target: info.target, sessionName: info.sessionName, title, attachedExisting: true, at: Date.now() });
+    return { sessionName: info.sessionName, target: info.target, title };
   }
 
   function reportProcessExit(ctx: any, attachment: LiveTerminalAttachment, status: string) {
@@ -757,13 +1114,9 @@ sleep 300`)}`;
         return;
       }
       try {
-        const paneId = (await tmux(["display-message", "-p", "-t", target, "#{pane_id}"])).trim();
-        const sessionName = (await tmux(["display-message", "-p", "-t", target, "#{session_name}"])).trim() || undefined;
         const title = titleParts.join(" ") || target;
-        const attachment = { target: paneId || target, sessionName, title, state: "running" as const };
-        showWidget(ctx, attachment);
-        pi.appendEntry(ENTRY_TYPE, { action: "open", target: paneId || target, sessionName, title, attachedExisting: true, at: Date.now() });
-        ctx.ui.notify(`Attached Tmux widget to session ${attachmentName(attachment)}`, "info");
+        const result = await attachLiveTerminal(ctx, target, { title });
+        ctx.ui.notify(attachedMessage(result.sessionName, result.target), "info");
       } catch (error) {
         ctx.ui.notify(`Could not attach to tmux session ${target}: ${error instanceof Error ? error.message : String(error)}`, "warning");
       }
@@ -774,21 +1127,31 @@ sleep 300`)}`;
     name: "live_terminal_run",
     label: "Run Live Terminal",
     description:
-      "Start a command in a detached tmux session and show a live Tmux widget attached to it. Returns the tmux session id immediately.",
+      "Start a command in a detached tmux session, or attach to an existing tmux target when no command is provided. Can optionally wait for regex output or lifecycle events.",
     promptSnippet:
-      "live_terminal_run: run a command in a detached tmux session with a live Tmux widget visible to the user.",
+      "live_terminal_run: run a command in a detached tmux session or attach to an existing session, with a live Tmux widget visible to the user.",
     promptGuidelines: [
       "For interactive, TTY, full-screen, watch-mode, development-server, or long-running flows, use live_terminal_run instead of bash so the user can see and interact with the running process.",
+      "Omit command and pass session_name or target to attach to an existing tmux session instead of starting a new command.",
+      "Pass wait_for.regex to wait until captured terminal output matches a JavaScript regular expression, or wait_for.event='exit'/'target_closed' to wait for an event. Defaults: timeout_ms=30000, poll_ms=500.",
+      "For long-running workflows, prefer starting the live terminal first, doing other useful work, then calling live_terminal_run again without command and with session_name/target plus wait_for when you need to wait for the next terminal state.",
       "When the session is no longer needed, use live_terminal_close to close the widget and kill the tmux session.",
     ],
     parameters: Type.Object({
-      command: Type.String({
-        description: "Shell command to run in the tmux session.",
-      }),
+      command: Type.Optional(
+        Type.String({
+          description: "Shell command to run in a new tmux session. If omitted, live_terminal_run attaches to session_name or target instead.",
+        }),
+      ),
       session_name: Type.Optional(
         Type.String({
           description:
-            "Optional tmux session name. Defaults to pi-live-<random>.",
+            "Optional tmux session name. With command, names the new session and defaults to pi-live-<random>. Without command, names the existing session to attach to.",
+        }),
+      ),
+      target: Type.Optional(
+        Type.String({
+          description: "Existing tmux target to attach to when command is omitted, e.g. my-session or my-session:0.0.",
         }),
       ),
       title: Type.Optional(
@@ -801,38 +1164,98 @@ sleep 300`)}`;
           description: "Working directory. Defaults to the current Pi cwd.",
         }),
       ),
+      wait_for: Type.Optional(
+        Type.Object({
+          regex: Type.Optional(
+            Type.String({
+              description: "JavaScript regular expression source to match against captured tmux pane output.",
+            }),
+          ),
+          event: Type.Optional(
+            Type.Union([
+              Type.Literal("exit"),
+              Type.Literal("target_closed"),
+            ], {
+              description: "Event to wait for. 'exit' waits for commands started by live_terminal_run to record an exit status; 'target_closed' waits until the tmux target disappears.",
+            }),
+          ),
+          ignore_case: Type.Optional(
+            Type.Boolean({
+              description: "Compile wait_for.regex case-insensitively.",
+            }),
+          ),
+          timeout_ms: Type.Optional(
+            Type.Number({
+              description: "Maximum time to wait in milliseconds. Defaults to 30000.",
+            }),
+          ),
+          poll_ms: Type.Optional(
+            Type.Number({
+              description: "Polling period in milliseconds. Defaults to 500.",
+            }),
+          ),
+        }),
+      ),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const result = await startLiveTerminal(
-        { ...ctx, cwd: params.cwd || ctx.cwd },
-        params.command,
-        { sessionName: params.session_name, title: params.title || params.session_name || DEFAULT_TITLE },
-      );
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const command = typeof params.command === "string" ? params.command.trim() : "";
+      let result: { sessionName?: string; target: string; title: string; command?: string; cwd?: string };
+      let visibleMessage: string;
+
+      if (command) {
+        if (params.target) throw new Error("target can only be used when command is omitted.");
+        result = await startLiveTerminal(
+          { ...ctx, cwd: params.cwd || ctx.cwd },
+          command,
+          { sessionName: params.session_name, title: params.title || params.session_name || DEFAULT_TITLE },
+        );
+        visibleMessage = startedVisibleMessage(result.sessionName!);
+      } else {
+        const attachTarget = params.target || params.session_name;
+        if (!attachTarget) throw new Error("live_terminal_run requires command, or session_name/target to attach to an existing tmux session.");
+        result = await attachLiveTerminal(ctx, attachTarget, { title: params.title || params.session_name || params.target });
+        visibleMessage = attachedMessage(result.sessionName, result.target);
+      }
+
+      let waitResult: WaitResult | undefined;
+      if (params.wait_for) {
+        waitResult = await waitForTerminal(result.target, params.wait_for, signal);
+        visibleMessage = `${visibleMessage} ${waitResultMessage(waitResult)}`;
+      }
 
       return {
         content: [
           {
             type: "text",
-            text: startedMessage(result.sessionName),
+            text: visibleMessage,
           },
         ],
-        details: { sessionName: result.sessionName, command: params.command, cwd: result.cwd, visibleMessage: startedVisibleMessage(result.sessionName) },
+        details: { sessionName: result.sessionName, target: result.target, command: result.command, cwd: result.cwd, waitResult, visibleMessage },
       };
     },
     renderCall(args, theme) {
-      const toolArgs = args as { command?: unknown };
+      const toolArgs = args as { command?: unknown; session_name?: unknown; target?: unknown; wait_for?: unknown };
       const command = typeof toolArgs.command === "string" ? toolArgs.command : "";
-      const content = theme.fg("toolTitle", "live_terminal_run ") + theme.fg("dim", compactText(command, 160));
+      const attachTarget = typeof toolArgs.target === "string"
+        ? toolArgs.target
+        : typeof toolArgs.session_name === "string"
+          ? toolArgs.session_name
+          : "";
+      const summary = command ? command : `attach ${attachTarget}`;
+      const waitSummary = waitForRenderSummary(toolArgs.wait_for);
+      const waitText = waitSummary ? ` wait=${JSON.stringify(compactText(waitSummary, 80))}` : "";
+      const content = theme.fg("toolTitle", "live_terminal_run ") + theme.fg("dim", `${compactText(summary, 120)}${waitText}`);
       return new Text(content, 0, 0);
     },
     renderResult(result, _options, theme) {
-      const details = result.details as { visibleMessage?: unknown; sessionName?: unknown } | undefined;
+      const details = result.details as { visibleMessage?: unknown; sessionName?: unknown; waitResult?: { timedOut?: unknown } } | undefined;
       const message = typeof details?.visibleMessage === "string"
         ? details.visibleMessage
         : typeof details?.sessionName === "string"
           ? startedVisibleMessage(details.sessionName)
-          : "Started and attached to tmux session.";
-      return new Text(theme.fg("success", message), 0, 0);
+          : "Opened live terminal.";
+      const color = details?.waitResult?.timedOut ? "warning" : "success";
+      return new Text(theme.fg(color, message), 0, 0);
     },
   });
 
