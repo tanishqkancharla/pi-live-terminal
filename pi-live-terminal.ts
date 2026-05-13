@@ -371,6 +371,71 @@ async function capturePaneText(target: string): Promise<string> {
   ]);
 }
 
+async function capturePaneDisplayLines(target: string): Promise<string[]> {
+  const output = await tmux([
+    "capture-pane",
+    "-p",
+    "-e",
+    "-J",
+    "-S",
+    `-${CAPTURE_LINES}`,
+    "-t",
+    target,
+  ]);
+  const trimmed = output.replace(/\s+$/g, "");
+  return (trimmed ? trimmed.split("\n") : [""]).map(sanitizePaneLine);
+}
+
+function skipEscapeSequence(value: string, position: number): number {
+  const next = value[position + 1];
+  if (!next) return 1;
+
+  if (next === "[") {
+    for (let i = position + 2; i < value.length; i++) {
+      const code = value.charCodeAt(i);
+      if (code >= 0x40 && code <= 0x7e) return i + 1 - position;
+    }
+    return value.length - position;
+  }
+
+  if (next === "]" || next === "P" || next === "_" || next === "^") {
+    for (let i = position + 2; i < value.length; i++) {
+      if (value[i] === "\x07") return i + 1 - position;
+      if (value[i] === "\x1b" && value[i + 1] === "\\") return i + 2 - position;
+    }
+    return value.length - position;
+  }
+
+  return 2;
+}
+
+function sanitizePaneLine(line: string): string {
+  let result = "";
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] === "\x1b") {
+      const sgr = line.slice(i).match(/^\x1b\[[0-9;:]*m/);
+      if (sgr) {
+        result += sgr[0];
+        i += sgr[0].length;
+      } else {
+        i += skipEscapeSequence(line, i);
+      }
+      continue;
+    }
+
+    const code = line.codePointAt(i) ?? 0;
+    const char = String.fromCodePoint(code);
+    if (char === "\t") {
+      result += "   ";
+    } else if ((code >= 0x20 && code < 0x7f) || code > 0x9f) {
+      result += char;
+    }
+    i += char.length;
+  }
+  return result;
+}
+
 async function waitForTerminal(target: string, waitFor: WaitForOptions, signal?: AbortSignal): Promise<WaitResult> {
   const { condition, timeoutMs, pollMs } = parseWaitFor(waitFor);
   const startedAt = Date.now();
@@ -463,6 +528,10 @@ class LiveTerminalWidget implements Component {
   private scrollOffset = 0;
   private lastResize = "";
   private unsubscribeStream?: () => Promise<void>;
+  private refreshTimer?: NodeJS.Timeout;
+  private refreshRunning = false;
+  private refreshAgain = false;
+  private disposed = false;
 
   constructor(
     private tui: TUI,
@@ -477,68 +546,90 @@ class LiveTerminalWidget implements Component {
 
   private async initialize(): Promise<void> {
     try {
-      const output = await tmux([
-        "capture-pane",
-        "-p",
-        "-e",
-        "-J",
-        "-S",
-        `-${CAPTURE_LINES}`,
-        "-t",
-        this.target,
-      ]);
-      this.lines = output.replace(/\s+$/g, "").split("\n");
-      this.pendingLine = "";
-      this.error = undefined;
       this.unsubscribeStream = await subscribePaneOutput(this.target, (chunk) => this.appendChunk(chunk));
+      if (this.disposed) {
+        await this.unsubscribeStream().catch(() => {});
+        this.unsubscribeStream = undefined;
+        return;
+      }
+
+      await this.refreshOutput();
+      if (this.disposed) return;
+
       await this.refreshStatus();
+      if (this.disposed) return;
       this.scrollOffset = maxScrollOffset(this.lineCount(), VISIBLE_LINES);
     } catch (error) {
+      if (this.disposed) return;
       this.error = error instanceof Error ? error.message : String(error);
       this.tui.requestRender();
       return;
     }
-    this.tui.requestRender();
+    if (!this.disposed) this.tui.requestRender();
   }
 
   private lineCount(): number {
     return this.lines.length + (this.pendingLine ? 1 : 0);
   }
 
-  private appendChunk(chunk: string): void {
+  private appendChunk(_chunk: string): void {
+    this.scheduleOutputRefresh();
+  }
+
+  private scheduleOutputRefresh(): void {
+    if (this.disposed || this.refreshTimer) return;
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = undefined;
+      void this.refreshOutput();
+    }, 16);
+  }
+
+  private async refreshOutput(): Promise<void> {
+    if (this.disposed) return;
+    if (this.refreshRunning) {
+      this.refreshAgain = true;
+      return;
+    }
+
+    this.refreshRunning = true;
     const wasAtBottom = this.scrollOffset >= maxScrollOffset(this.lineCount(), VISIBLE_LINES);
-    const normalized = chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const parts = normalized.split("\n");
-
-    this.pendingLine += parts.shift() || "";
-    for (const part of parts) {
-      this.lines.push(this.pendingLine);
-      this.pendingLine = part;
+    try {
+      const lines = await capturePaneDisplayLines(this.target);
+      if (this.disposed) return;
+      this.lines = lines;
+      this.pendingLine = "";
+      this.scrollOffset = wasAtBottom
+        ? maxScrollOffset(this.lineCount(), VISIBLE_LINES)
+        : clampScrollOffset(this.scrollOffset, this.lineCount(), VISIBLE_LINES);
+      this.error = undefined;
+    } catch (error) {
+      if (!this.disposed) this.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.refreshRunning = false;
+      if (!this.disposed) {
+        this.tui.requestRender();
+        if (this.refreshAgain) {
+          this.refreshAgain = false;
+          this.scheduleOutputRefresh();
+        }
+      }
     }
-
-    if (this.lines.length > CAPTURE_LINES) {
-      this.lines = this.lines.slice(this.lines.length - CAPTURE_LINES);
-    }
-
-    this.scrollOffset = wasAtBottom
-      ? maxScrollOffset(this.lineCount(), VISIBLE_LINES)
-      : clampScrollOffset(this.scrollOffset, this.lineCount(), VISIBLE_LINES);
-    this.error = undefined;
-    this.tui.requestRender();
   }
 
   private async refreshStatus(): Promise<void> {
+    if (this.disposed) return;
     try {
       const exitStatus = await getExitStatus(this.target);
+      if (this.disposed) return;
       const wasCompleted = this.state === "completed";
       this.exitStatus = exitStatus;
       this.state = exitStatus ? "completed" : "running";
       if (exitStatus && !wasCompleted) this.onExit?.(exitStatus);
       this.scrollOffset = clampScrollOffset(this.scrollOffset, this.lineCount(), VISIBLE_LINES);
     } catch (error) {
-      this.error = error instanceof Error ? error.message : String(error);
+      if (!this.disposed) this.error = error instanceof Error ? error.message : String(error);
     }
-    this.tui.requestRender();
+    if (!this.disposed) this.tui.requestRender();
   }
 
   handleInput(data: string): void {
@@ -574,6 +665,7 @@ class LiveTerminalWidget implements Component {
     const shortcut = (s: string) => th.fg("muted", s);
     const muted = (s: string) => th.fg("muted", s);
     const dim = (s: string) => th.fg("dim", s);
+    const reset = "\x1b[0m";
     const pad = (s: string) =>
       truncateToWidth(s, innerW, "…", true).padEnd(
         Math.max(
@@ -601,9 +693,9 @@ class LiveTerminalWidget implements Component {
       this.scrollOffset + VISIBLE_LINES,
     );
     for (const line of visible)
-      result.push(border("│") + pad(`${" ".repeat(CONTENT_PADDING)}${line}`) + border("│"));
+      result.push(border("│") + pad(`${" ".repeat(CONTENT_PADDING)}${line}`) + reset + border("│"));
     for (let i = visible.length; i < VISIBLE_LINES; i++)
-      result.push(border("│") + pad("") + border("│"));
+      result.push(border("│") + pad("") + reset + border("│"));
 
     const hints = (this.state === "completed"
       ? [
@@ -624,6 +716,11 @@ class LiveTerminalWidget implements Component {
   invalidate(): void {}
 
   dispose(): void {
+    this.disposed = true;
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
     clearInterval(this.timer);
     if (this.unsubscribeStream) {
       void this.unsubscribeStream().catch(() => {});
@@ -642,6 +739,10 @@ class TmuxFocusModal implements Component {
   private scrollOffset = 0;
   private lastResize = "";
   private unsubscribeStream?: () => Promise<void>;
+  private refreshTimer?: NodeJS.Timeout;
+  private refreshRunning = false;
+  private refreshAgain = false;
+  private disposed = false;
 
   constructor(
     private tui: TUI,
@@ -662,69 +763,91 @@ class TmuxFocusModal implements Component {
 
   private async initialize(): Promise<void> {
     try {
-      const output = await tmux([
-        "capture-pane",
-        "-p",
-        "-e",
-        "-J",
-        "-S",
-        `-${CAPTURE_LINES}`,
-        "-t",
-        this.target,
-      ]);
-      this.lines = output.replace(/\s+$/g, "").split("\n");
-      this.pendingLine = "";
-      this.error = undefined;
       this.unsubscribeStream = await subscribePaneOutput(this.target, (chunk) => this.appendChunk(chunk));
+      if (this.disposed) {
+        await this.unsubscribeStream().catch(() => {});
+        this.unsubscribeStream = undefined;
+        return;
+      }
+
+      await this.refreshOutput();
+      if (this.disposed) return;
+
       await this.refreshStatus();
+      if (this.disposed) return;
       this.scrollOffset = maxScrollOffset(this.lineCount(), this.visibleLines());
     } catch (error) {
+      if (this.disposed) return;
       this.error = error instanceof Error ? error.message : String(error);
       this.tui.requestRender();
       return;
     }
-    this.tui.requestRender();
+    if (!this.disposed) this.tui.requestRender();
   }
 
   private lineCount(): number {
     return this.lines.length + (this.pendingLine ? 1 : 0);
   }
 
-  private appendChunk(chunk: string): void {
+  private appendChunk(_chunk: string): void {
+    this.scheduleOutputRefresh();
+  }
+
+  private scheduleOutputRefresh(): void {
+    if (this.disposed || this.refreshTimer) return;
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = undefined;
+      void this.refreshOutput();
+    }, 16);
+  }
+
+  private async refreshOutput(): Promise<void> {
+    if (this.disposed) return;
+    if (this.refreshRunning) {
+      this.refreshAgain = true;
+      return;
+    }
+
+    this.refreshRunning = true;
     const visibleLines = this.visibleLines();
     const wasAtBottom = this.scrollOffset >= maxScrollOffset(this.lineCount(), visibleLines);
-    const normalized = chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const parts = normalized.split("\n");
-
-    this.pendingLine += parts.shift() || "";
-    for (const part of parts) {
-      this.lines.push(this.pendingLine);
-      this.pendingLine = part;
+    try {
+      const lines = await capturePaneDisplayLines(this.target);
+      if (this.disposed) return;
+      this.lines = lines;
+      this.pendingLine = "";
+      this.scrollOffset = wasAtBottom
+        ? maxScrollOffset(this.lineCount(), visibleLines)
+        : clampScrollOffset(this.scrollOffset, this.lineCount(), visibleLines);
+      this.error = undefined;
+    } catch (error) {
+      if (!this.disposed) this.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.refreshRunning = false;
+      if (!this.disposed) {
+        this.tui.requestRender();
+        if (this.refreshAgain) {
+          this.refreshAgain = false;
+          this.scheduleOutputRefresh();
+        }
+      }
     }
-
-    if (this.lines.length > CAPTURE_LINES) {
-      this.lines = this.lines.slice(this.lines.length - CAPTURE_LINES);
-    }
-
-    this.scrollOffset = wasAtBottom
-      ? maxScrollOffset(this.lineCount(), visibleLines)
-      : clampScrollOffset(this.scrollOffset, this.lineCount(), visibleLines);
-    this.error = undefined;
-    this.tui.requestRender();
   }
 
   private async refreshStatus(): Promise<void> {
+    if (this.disposed) return;
     try {
       const exitStatus = await getExitStatus(this.target);
+      if (this.disposed) return;
       const wasCompleted = this.state === "completed";
       this.exitStatus = exitStatus;
       this.state = exitStatus ? "completed" : "running";
       if (exitStatus && !wasCompleted) this.onExit?.(exitStatus);
       this.scrollOffset = clampScrollOffset(this.scrollOffset, this.lineCount(), this.visibleLines());
     } catch (error) {
-      this.error = error instanceof Error ? error.message : String(error);
+      if (!this.disposed) this.error = error instanceof Error ? error.message : String(error);
     }
-    this.tui.requestRender();
+    if (!this.disposed) this.tui.requestRender();
   }
 
   handleInput(data: string): void {
@@ -776,6 +899,7 @@ class TmuxFocusModal implements Component {
     const border = (s: string) => th.fg("borderAccent", s);
     const shortcut = (s: string) => th.fg("accent", s);
     const dim = (s: string) => th.fg("dim", s);
+    const reset = "\x1b[0m";
     const pad = (s: string) =>
       truncateToWidth(s, innerW, "…", true).padEnd(
         Math.max(
@@ -802,9 +926,9 @@ class TmuxFocusModal implements Component {
       this.scrollOffset + visibleLines,
     );
     for (const line of visible)
-      result.push(border("│") + pad(`${" ".repeat(CONTENT_PADDING)}${line}`) + border("│"));
+      result.push(border("│") + pad(`${" ".repeat(CONTENT_PADDING)}${line}`) + reset + border("│"));
     for (let i = visible.length; i < visibleLines; i++)
-      result.push(border("│") + pad("") + border("│"));
+      result.push(border("│") + pad("") + reset + border("│"));
 
     const hints = [
       shortcut(" ctrl+shift+f ") + dim("close focus"),
@@ -821,6 +945,11 @@ class TmuxFocusModal implements Component {
 
   dispose(): void {
     disableMouseReporting();
+    this.disposed = true;
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
     clearInterval(this.timer);
     if (this.unsubscribeStream) {
       void this.unsubscribeStream().catch(() => {});

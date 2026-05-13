@@ -1,6 +1,6 @@
 {
   "name": "pi-live-terminal",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Pi extension that runs commands in tmux and displays a live terminal widget.",
   "repository": {
     "type": "git",
