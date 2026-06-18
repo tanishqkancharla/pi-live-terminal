@@ -126,8 +126,15 @@ function waitDescription(condition: WaitCondition): string {
 function waitResultMessage(result: WaitResult): string {
   if (result.timedOut) return `Timed out after ${result.elapsedMs}ms waiting for ${result.condition}.`;
   if (result.status !== undefined) return `Matched ${result.condition} with status ${result.status} after ${result.elapsedMs}ms.`;
-  if (result.match !== undefined) return `Matched ${result.condition} after ${result.elapsedMs}ms: ${compactText(result.match, 120)}`;
+  if (result.match !== undefined) return `Matched wait regex:\n\n${result.match}`;
   return `Matched ${result.condition} after ${result.elapsedMs}ms.`;
+}
+
+function lineForMatch(text: string, match: RegExpMatchArray): string {
+  const index = match.index ?? 0;
+  const start = text.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+  const end = text.indexOf("\n", index + match[0].length);
+  return text.slice(start, end === -1 ? text.length : end).replace(/\r$/, "");
 }
 
 function waitForRenderSummary(waitFor: unknown): string | undefined {
@@ -468,9 +475,10 @@ async function waitForTerminal(target: string, waitFor: WaitForOptions, signal?:
         return { matched: true, condition: description, status, elapsedMs: Date.now() - startedAt };
       }
     } else if (condition.kind === "regex") {
-      const match = (await capturePaneText(target)).match(condition.regex);
+      const output = await capturePaneText(target);
+      const match = output.match(condition.regex);
       if (match) {
-        return { matched: true, condition: description, match: match[0], elapsedMs: Date.now() - startedAt };
+        return { matched: true, condition: description, match: lineForMatch(output, match), elapsedMs: Date.now() - startedAt };
       }
     }
 
